@@ -57,9 +57,22 @@ Usage
     "Add files..." attaches copies of files, "Remove" detaches them and
     "Save copy..." writes an attached file back to disk. A document that has
     attachments shows a paper clip in its lower right corner.
+  * Edit > Roles dictionary... (or the "Roles..." button above the process
+    table) opens a separate window with the table Role | Description |
+    Actual set. The actual set of a role is what it currently consists of:
+    user names and/or other roles of the same dictionary. Double-click the
+    cell (or press Enter in it, or use "Edit actual set...") to tick the
+    included roles and the users. Every user already entered for any role is
+    offered as a tick box (one person can hold several roles); new names are
+    typed below the list. A role can never include itself,
+    directly or through other roles. Renaming a role renames it in the
+    process tables too; deleting one clears it there.
+    In the process table the Role cell of a set is a drop-down list of the
+    roles of the dictionary (one list per set).
   * Ctrl + mouse wheel zooms, middle mouse button pans, Esc cancels.
   * File > Save / Open: a diagram is stored as a tar archive with the
-    extension .bpmn. It contains diagram.json and, for every attachment,
+    extension .bpmn. It contains diagram.json (the diagram and the roles
+    dictionary) and, for every attachment,
     attachments/<document id>/<file name>. (Plain .json diagrams written by
     earlier versions can still be opened.) PNG and SVG export included.
 
@@ -105,6 +118,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -662,6 +677,226 @@ def sets_from_list(data, by_id, ins, outs) -> list:
                                str(d.get("process", "")), rows))
     return result
 # table-model-end
+
+# roles-begin  (pure data, no widgets - see tests)
+def normalize_name(text) -> str:
+    """Names of roles and users: surrounding and repeated blanks are dropped."""
+    return " ".join(str(text).split())
+
+
+def parse_usernames(text) -> list[str]:
+    """User names typed or pasted by the user: separated by commas,
+    semicolons or line breaks; duplicates are dropped."""
+    text = str(text)
+    for sep in (";", "\n", "\r", "\t"):
+        text = text.replace(sep, ",")
+    found: list[str] = []
+    for part in text.split(","):
+        name = normalize_name(part)
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+class Role:
+    """One entry of the dictionary. Its actual set (what it currently consists
+    of) is `users` (user names) plus `roles` (names of other dictionary roles)."""
+
+    __slots__ = ("name", "description", "users", "roles")
+
+    def __init__(self, name, description="", users=None, roles=None):
+        self.name = name
+        self.description = description
+        self.users: list[str] = list(users or [])
+        self.roles: list[str] = list(roles or [])
+
+
+class RoleDictionary:
+    """The roles of a diagram. Names are unique (ignoring case) and roles can
+    never include each other in a loop."""
+
+    def __init__(self):
+        self.items: list[Role] = []
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def names(self) -> list[str]:
+        return [r.name for r in self.items]
+
+    def find(self, name) -> "Role | None":
+        for r in self.items:
+            if r.name == name:
+                return r
+        return None
+
+    def has(self, name) -> bool:
+        return self.find(name) is not None
+
+    def _clash(self, name, ignore=None) -> "Role | None":
+        key = normalize_name(name).casefold()
+        for r in self.items:
+            if r is not ignore and r.name.casefold() == key:
+                return r
+        return None
+
+    def unique_name(self, base: str = "New role") -> str:
+        name, n = base, 1
+        while self._clash(name) is not None:
+            n += 1
+            name = f"{base} {n}"
+        return name
+
+    def add(self, name: str = "", description: str = "") -> Role:
+        name = normalize_name(name)
+        if name and self._clash(name) is not None:
+            raise ValueError(f"A role named “{name}” already exists.")
+        role = Role(name or self.unique_name(), description)
+        self.items.append(role)
+        return role
+
+    def rename(self, old: str, new: str) -> str:
+        """Rename a role (also where other roles include it). Returns the name
+        actually used; raises ValueError if the new name is not acceptable."""
+        role = self.find(old)
+        if role is None:
+            raise ValueError(f"There is no role “{old}”.")
+        new = normalize_name(new)
+        if not new:
+            raise ValueError("A role needs a name.")
+        if self._clash(new, ignore=role) is not None:
+            raise ValueError(f"A role named “{new}” already exists.")
+        for r in self.items:
+            r.roles = [new if n == old else n for n in r.roles]
+        role.name = new
+        return new
+
+    def remove(self, name: str) -> None:
+        role = self.find(name)
+        if role is None:
+            return
+        self.items.remove(role)
+        for r in self.items:
+            r.roles = [n for n in r.roles if n != name]
+
+    def descendants(self, name: str) -> set:
+        """Names of all roles that `name` includes, directly or indirectly."""
+        seen: set = set()
+        todo = [name]
+        while todo:
+            r = self.find(todo.pop())
+            for child in (r.roles if r else []):
+                if child not in seen:
+                    seen.add(child)
+                    todo.append(child)
+        return seen
+
+    def can_include(self, parent: str, child: str) -> bool:
+        """May role `parent` include role `child` without creating a loop?"""
+        if parent == child or not self.has(parent) or not self.has(child):
+            return False
+        return parent not in self.descendants(child)
+
+    def set_members(self, name: str, users, roles) -> None:
+        """Replace the actual set of a role. All-or-nothing."""
+        role = self.find(name)
+        if role is None:
+            raise ValueError(f"There is no role “{name}”.")
+        new_users: list[str] = []
+        for u in users:
+            u = normalize_name(u)
+            if u and u not in new_users:
+                new_users.append(u)
+        new_roles: list[str] = []
+        for n in roles:
+            if n in new_roles:
+                continue
+            if not self.has(n):
+                raise ValueError(f"There is no role “{n}”.")
+            if not self.can_include(name, n):
+                raise ValueError(f"“{name}” cannot include “{n}”: "
+                                 "that would make a loop.")
+            new_roles.append(n)
+        role.users, role.roles = new_users, new_roles
+
+    def all_users(self) -> list[str]:
+        """Every user name used anywhere in the dictionary, one each, sorted."""
+        found: dict[str, str] = {}
+        for r in self.items:
+            for u in r.users:
+                found.setdefault(u.casefold(), u)
+        return sorted(found.values(), key=lambda u: (u.casefold(), u))
+
+    def roles_of_user(self, user: str) -> list[str]:
+        """Names of the roles that list `user` directly."""
+        return [r.name for r in self.items if user in r.users]
+
+    def effective_users(self, name: str) -> list[str]:
+        """Every user of the role, including those of the roles it includes."""
+        order: list[str] = []
+        seen: set = set()
+
+        def walk(n: str) -> None:             # own users first, then each included role in turn
+            if n in seen:
+                return
+            seen.add(n)
+            r = self.find(n)
+            if r is None:
+                return
+            for u in r.users:
+                if u not in order:
+                    order.append(u)
+            for child in r.roles:
+                walk(child)
+
+        walk(name)
+        return order
+
+    def members_text(self, name: str) -> str:
+        """One-line form of the actual set: [Included role], user, user ..."""
+        r = self.find(name)
+        if r is None:
+            return ""
+        return ", ".join([f"[{n}]" for n in r.roles] + list(r.users))
+
+    def to_list(self) -> list[dict]:
+        return [{"name": r.name, "description": r.description,
+                 "users": list(r.users), "roles": list(r.roles)} for r in self.items]
+
+    @classmethod
+    def from_list(cls, data) -> "RoleDictionary":
+        """Inverse of to_list. Never raises: whatever is unusable in a
+        hand-edited file (bad types, duplicates, loops) is left out."""
+        result = cls()
+        if not isinstance(data, list):
+            return result
+        pending = []
+        for d in data:
+            if not isinstance(d, dict) or not isinstance(d.get("name"), str):
+                continue
+            name = normalize_name(d["name"])
+            if not name or result._clash(name) is not None:
+                continue
+            users: list[str] = []
+            for u in d.get("users") if isinstance(d.get("users"), list) else []:
+                u = normalize_name(u) if isinstance(u, str) else ""
+                if u and u not in users:
+                    users.append(u)
+            desc = d.get("description")
+            role = Role(name, desc if isinstance(desc, str) else "", users)
+            result.items.append(role)
+            pending.append((role, d.get("roles")))
+        for role, kids in pending:
+            for k in kids if isinstance(kids, list) else []:
+                k = normalize_name(k) if isinstance(k, str) else ""
+                if k and k not in role.roles and result.can_include(role.name, k):
+                    role.roles.append(k)
+        return result
+# roles-end
+
 
 
 # attachments-begin  (files and the .bpmn archive, no widgets - see tests)
@@ -1550,6 +1785,7 @@ class DiagramScene(QGraphicsScene):
     message = Signal(str, bool)       # text, is_error
     dirtyChanged = Signal(bool)
     contentChanged = Signal()         # anything in the diagram changed
+    rolesChanged = Signal()           # the roles dictionary changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1560,6 +1796,7 @@ class DiagramScene(QGraphicsScene):
         self.exporting = False
         self.dirty = False
         self.store = AttachmentStore()      # private copies of the attached files
+        self.roles = RoleDictionary()       # saved in the .bpmn file
         self._pending: NodeItem | None = None
         self._rubber: QGraphicsPathItem | None = None
         self._press_scene_pos = QPointF()
@@ -1586,6 +1823,51 @@ class DiagramScene(QGraphicsScene):
     def touch(self) -> None:
         self.set_dirty(True)
         self.contentChanged.emit()
+
+    # ---- roles dictionary (the Roles window and the process tables use these) -- #
+    def _table_sets(self):
+        for node in self.nodes():
+            if isinstance(node, ProcessItem):
+                yield from node.table
+
+    def roles_touch(self) -> None:
+        self.set_dirty(True)
+        self.rolesChanged.emit()
+
+    def role_usage(self, name: str) -> int:
+        """In how many process-table sets the role is chosen."""
+        return sum(1 for st in self._table_sets() if st.role == name)
+
+    def add_role(self, name: str = "") -> Role:
+        role = self.roles.add(name)
+        self.roles_touch()
+        return role
+
+    def rename_role(self, old: str, new: str) -> str:
+        used = self.roles.rename(old, new)       # raises ValueError
+        if used != old:
+            for st in self._table_sets():
+                if st.role == old:
+                    st.role = used
+        self.roles_touch()
+        return used
+
+    def delete_role(self, name: str) -> None:
+        self.roles.remove(name)
+        for st in self._table_sets():
+            if st.role == name:
+                st.role = ""
+        self.roles_touch()
+
+    def set_role_description(self, name: str, text: str) -> None:
+        role = self.roles.find(name)
+        if role is not None and role.description != text:
+            role.description = text
+            self.roles_touch()
+
+    def set_role_members(self, name: str, users, roles) -> None:
+        self.roles.set_members(name, users, roles)   # raises ValueError
+        self.roles_touch()
 
     def set_dirty(self, value: bool) -> None:
         if value != self.dirty:
@@ -1879,6 +2161,7 @@ class DiagramScene(QGraphicsScene):
             "version": 2,
             "nodes": [n.to_dict(ids[id(n)], ids, files) for n in nodes],
             "connections": [c.to_dict(ids) for c in conns],
+            "roles": self.roles.to_list(),
         }
 
     def load_dict(self, data: dict, files: dict | None = None) -> int:
@@ -1929,8 +2212,11 @@ class DiagramScene(QGraphicsScene):
                                    [a.name for a in node.attachments])
                 node.attachments.append(Attachment(name, src))
             node.attachments_changed()
+        roles = RoleDictionary.from_list(data.get("roles"))
         # Everything parsed fine - now replace the current diagram.
         self.reset()
+        self.roles = roles
+        self.rolesChanged.emit()
         for n in by_id.values():
             self.addItem(n)
         for c in conns:
@@ -1946,6 +2232,8 @@ class DiagramScene(QGraphicsScene):
         for n in self.nodes():                   # their attached files are not needed any more
             self.discard_attachments(n)
         self.clear()
+        self.roles = RoleDictionary()
+        self.rolesChanged.emit()
         self.set_dirty(False)
 
     # ---- export ------------------------------------------------------------ #
@@ -2074,6 +2362,7 @@ TABLE_COLUMNS = ("Input document", "Role", "Term", "Process", "Output document")
 COL_IN, COL_ROLE, COL_TERM, COL_PROC, COL_OUT = range(5)
 TEXT_FIELDS = {COL_ROLE: "role", COL_TERM: "term", COL_PROC: "process"}
 DEFAULT_PANEL_HEIGHT = 240
+C_STALE = QColor("#b3261e")           # a role that is not in the dictionary
 
 
 class ProcessTable(QTableWidget):
@@ -2147,10 +2436,41 @@ class DocDelegate(QStyledItemDelegate):
         self.panel.set_doc(index.row(), self.kind, node)
 
 
+class RoleDelegate(DocDelegate):
+    """Drop-down editor for the Role cell of a set: the roles of the
+    dictionary (plus an empty entry). The cell spans all rows of the set, so
+    there is exactly one list per set."""
+
+    def __init__(self, panel: "ProcessTablePanel", parent=None):
+        super().__init__(panel, "role", parent)
+        self._names: list[str] = []
+
+    def createEditor(self, parent, option, index):
+        self._names = self.panel.role_choices(index.row())
+        combo = QComboBox(parent)
+        combo.addItem("")                 # no role
+        for name in self._names:
+            combo.addItem(name if self.panel.scene.roles.has(name)
+                          else f"{name}  (not in the dictionary)")
+        combo.activated.connect(lambda *_: self._finish(combo))
+        QTimer.singleShot(0, lambda: self._popup(combo))
+        return combo
+
+    def setEditorData(self, editor, index) -> None:
+        cur = self.panel.role_at(index.row())
+        editor.setCurrentIndex(self._names.index(cur) + 1 if cur in self._names else 0)
+
+    def setModelData(self, editor, model, index) -> None:
+        k = editor.currentIndex()
+        self.panel.set_role(index.row(), self._names[k - 1] if 0 < k <= len(self._names) else "")
+
+
 class ProcessTablePanel(QWidget):
     """Table of the selected process: Input document | Role | Term | Process |
     Output document. A set (Role/Term/Process) spans as many rows as it has
     document rows, so several inputs/outputs can share one set."""
+
+    rolesRequested = Signal()             # "Roles..." button: open the dictionary window
 
     def __init__(self, scene: DiagramScene, parent=None):
         super().__init__(parent)
@@ -2176,6 +2496,8 @@ class ProcessTablePanel(QWidget):
             "Delete row", "Remove the selected row from its set", self.delete_row)
         self.b_del_set = self._button(
             "Delete set", "Remove the selected set with all its rows", self.delete_set)
+        self.b_roles = self._button(
+            "Roles\u2026", "Open the Roles dictionary window", self.rolesRequested.emit)
 
         t = self.table = ProcessTable(0, len(TABLE_COLUMNS), self)
         t.setHorizontalHeaderLabels(list(TABLE_COLUMNS))
@@ -2186,13 +2508,15 @@ class ProcessTablePanel(QWidget):
         self._delegates = [DocDelegate(self, "in", t), DocDelegate(self, "out", t)]
         t.setItemDelegateForColumn(COL_IN, self._delegates[0])
         t.setItemDelegateForColumn(COL_OUT, self._delegates[1])
+        self._role_delegate = RoleDelegate(self, t)
+        t.setItemDelegateForColumn(COL_ROLE, self._role_delegate)
         t.itemChanged.connect(self._on_item_changed)
         t.currentCellChanged.connect(lambda *_: self._update_buttons())
         t.clearRequested.connect(self.clear_current_cell)
 
         top = QHBoxLayout()
         top.addWidget(self.title, 1)
-        for b in (self.b_set, self.b_row, self.b_del_row, self.b_del_set):
+        for b in (self.b_set, self.b_row, self.b_del_row, self.b_del_set, self.b_roles):
             top.addWidget(b)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 4, 6, 4)
@@ -2229,6 +2553,20 @@ class ProcessTablePanel(QWidget):
         if self.process is None:
             return []
         return self.process.input_docs() if kind == "in" else self.process.output_docs()
+
+    def role_at(self, row: int) -> str:
+        if self.process is None or not 0 <= row < len(self._row_map):
+            return ""
+        return self.process.table[self._row_map[row][0]].role
+
+    def role_choices(self, row: int) -> list[str]:
+        """Roles offered in the drop-down: the dictionary, plus the role the set
+        has now if it is no longer (or never was) in the dictionary."""
+        names = self.scene.roles.names()
+        cur = self.role_at(row)
+        if cur and cur not in names:
+            names.append(cur)
+        return names
 
     def doc_at(self, row: int, kind: str):
         if self.process is None or not 0 <= row < len(self._row_map):
@@ -2310,7 +2648,11 @@ class ProcessTablePanel(QWidget):
                     t.setItem(r0 + rj, COL_OUT,
                               self._cell(self._doc_text(row.out, lab_out), brush))
                 for col, field in TEXT_FIELDS.items():
-                    t.setItem(r0, col, self._cell(getattr(st, field), brush))
+                    cell = self._cell(getattr(st, field), brush)
+                    if col == COL_ROLE and st.role and not self.scene.roles.has(st.role):
+                        cell.setForeground(QBrush(C_STALE))
+                        cell.setToolTip("This role is not in the Roles dictionary.")
+                    t.setItem(r0, col, cell)
                     if n > 1:
                         t.setSpan(r0, col, n, 1)      # Role/Term/Process cover all rows
                 r0 += n
@@ -2331,7 +2673,8 @@ class ProcessTablePanel(QWidget):
         else:
             self.hint.setText("Double-click a cell to edit it. Add row gives the "
                               "selected set another row for one more document; "
-                              "Delete empties the current cell.")
+                              "Delete empties the current cell. Roles come from "
+                              "the Roles dictionary (Roles\u2026 button).")
         self._update_buttons()
 
     # ---- editing -------------------------------------------------------------------- #
@@ -2351,6 +2694,17 @@ class ProcessTablePanel(QWidget):
         if getattr(st, field) != item.text():
             setattr(st, field, item.text())
             self.scene.set_dirty(True)
+
+    def set_role(self, row: int, name: str) -> None:
+        """Called by the Role drop-down delegate."""
+        if self.process is None or not 0 <= row < len(self._row_map):
+            return
+        st = self.process.table[self._row_map[row][0]]
+        if st.role == name:
+            return
+        st.role = name
+        self.scene.set_dirty(True)
+        self._timer.start()
 
     def set_doc(self, row: int, kind: str, node) -> None:
         """Called by the drop-down delegate when a document was picked."""
@@ -2422,6 +2776,344 @@ class ProcessTablePanel(QWidget):
         self.table.setFocus()
         del p.table[si]
         self._changed((min(si, len(p.table) - 1), 0, COL_ROLE) if p.table else None)
+
+
+# --------------------------------------------------------------------------- #
+# Roles dictionary window
+# --------------------------------------------------------------------------- #
+ROLE_COLUMNS = ("Role", "Description", "Actual set")
+RCOL_NAME, RCOL_DESC, RCOL_SET = range(3)
+
+
+class MembersDialog(QDialog):
+    """Edit the actual set of one role: tick the roles it includes and the
+    users that belong to it. Every user already known to the dictionary is
+    offered, because one person can hold several roles; new names are typed
+    below the list. Roles that would make a loop cannot be ticked."""
+
+    def __init__(self, roles: RoleDictionary, role: Role, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Actual set of “{role.name}”")
+        self.setModal(True)
+        self.resize(560, 360)
+        self.role_name = role.name
+        self._role_items: list = []                  # (role name, list item)
+
+        intro = QLabel("The actual set is what the role consists of right now: "
+                       "other roles of the dictionary and/or users. A user may belong "
+                       "to several roles.")
+        intro.setWordWrap(True)
+
+        self.role_list = QListWidget()
+        for other in roles:
+            if other.name == role.name:
+                continue
+            item = QListWidgetItem(other.name)
+            flags = item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if not roles.can_include(role.name, other.name):
+                flags &= ~Qt.ItemFlag.ItemIsEnabled
+                item.setToolTip(f"“{other.name}” already includes "
+                                f"“{role.name}” - this would make a loop.")
+            item.setFlags(flags)
+            item.setCheckState(Qt.CheckState.Checked if other.name in role.roles
+                               else Qt.CheckState.Unchecked)
+            self.role_list.addItem(item)
+            self._role_items.append((other.name, item))
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Included roles (tick):"))
+        left.addWidget(self.role_list, 1)
+        if not self._role_items:
+            left.addWidget(QLabel("There are no other roles in the dictionary yet."))
+
+        # Every user already in the dictionary is offered: one person can belong
+        # to several roles. Ticked = a member of this role.
+        self._roles = roles
+        self.user_list = QListWidget()
+        for u in roles.all_users():
+            self._add_user_item(u, u in role.users)
+        for u in role.users:                          # this role's own users are always ticked
+            item = self._find_user(u)
+            if item is None:
+                self._add_user_item(u, True)
+            else:
+                item.setText(u)                       # (same user spelled differently elsewhere)
+                item.setCheckState(Qt.CheckState.Checked)
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("New user name, Enter to add (several: separate with commas)")
+        self.b_add = QPushButton("Add")
+        self.b_add.clicked.connect(lambda _=False: self.add_typed())
+        self.user_edit.returnPressed.connect(self._on_return)
+        row = QHBoxLayout()
+        row.addWidget(self.user_edit, 1)
+        row.addWidget(self.b_add)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Users (tick the ones that belong to this role):"))
+        right.addWidget(self.user_list, 1)
+        right.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        for b in buttons.buttons():
+            b.setAutoDefault(False)          # Enter in the name field means "Add"
+        self.b_add.setDefault(True)
+
+        cols = QHBoxLayout()
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        lay = QVBoxLayout(self)
+        lay.addWidget(intro)
+        lay.addLayout(cols, 1)
+        lay.addWidget(buttons)
+
+    # ---- users ------------------------------------------------------------- #
+    def _add_user_item(self, name: str, checked: bool):
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        others = [n for n in self._roles.roles_of_user(name) if n != self.role_name]
+        if others:
+            item.setToolTip("Also in: " + ", ".join(others))
+        self.user_list.addItem(item)
+        return item
+
+    def _find_user(self, name: str):
+        """The list entry for `name` (ignoring case), or None."""
+        key = name.casefold()
+        for i in range(self.user_list.count()):
+            item = self.user_list.item(i)
+            if item.text().casefold() == key:
+                return item
+        return None
+
+    def add_users(self, text: str) -> int:
+        """Tick the named users, adding the ones that are new. Returns how many
+        entries were created."""
+        created = 0
+        for name in parse_usernames(text):
+            item = self._find_user(name)
+            if item is None:
+                self._add_user_item(name, True)
+                created += 1
+            else:
+                item.setCheckState(Qt.CheckState.Checked)
+        return created
+
+    def add_typed(self) -> None:
+        self.add_users(self.user_edit.text())
+        self.user_edit.clear()
+        self.user_edit.setFocus()
+
+    def _on_return(self) -> None:
+        if self.user_edit.text().strip():
+            self.add_typed()
+        else:
+            self.accept()                    # Enter on an empty field = OK
+
+    # ---- result -------------------------------------------------------------- #
+    def accept(self) -> None:
+        self.add_users(self.user_edit.text())    # a name typed but not added yet
+        super().accept()
+
+    def members(self):
+        """(users, included role names) as edited."""
+        roles = [n for n, it in self._role_items
+                 if it.checkState() == Qt.CheckState.Checked]
+        users = [self.user_list.item(i).text() for i in range(self.user_list.count())
+                 if self.user_list.item(i).checkState() == Qt.CheckState.Checked]
+        return users, roles
+
+
+class RolesTable(QTableWidget):
+    editRequested = Signal()
+
+    def editing(self) -> bool:
+        return self.state() == QAbstractItemView.State.EditingState
+
+    def keyPressEvent(self, e):
+        if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not self.editing()
+                and self.currentColumn() == RCOL_SET):
+            self.editRequested.emit()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+
+class RolesWindow(QWidget):
+    """Separate window with the roles dictionary: Role | Description | Actual set."""
+
+    def __init__(self, scene: DiagramScene, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.scene = scene
+        self._building = False
+        self._names: list[str] = []                   # table row -> role name
+        self.setWindowTitle("Roles dictionary")
+        self.resize(780, 420)
+        self._timer = QTimer(self)                    # deferred refresh
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._flush)
+
+        self.b_add = self._button("Add role", "Add a new role to the dictionary", self.add_role)
+        self.b_del = self._button("Delete role", "Delete the selected role", self.delete_role)
+        self.b_members = self._button(
+            "Edit actual set…", "Choose the roles and users the selected role consists of",
+            self.edit_members)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+
+        t = self.table = RolesTable(0, len(ROLE_COLUMNS), self)
+        t.setHorizontalHeaderLabels(list(ROLE_COLUMNS))
+        t.verticalHeader().setVisible(False)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.setColumnWidth(RCOL_NAME, 170)
+        t.setColumnWidth(RCOL_DESC, 280)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        t.itemChanged.connect(self._on_item_changed)
+        t.currentCellChanged.connect(lambda *_: self._update_buttons())
+        t.cellDoubleClicked.connect(self._on_double_click)
+        t.editRequested.connect(self.edit_members)
+
+        top = QHBoxLayout()
+        top.addWidget(self.b_add)
+        top.addWidget(self.b_del)
+        top.addWidget(self.b_members)
+        top.addStretch(1)
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(t, 1)
+        lay.addWidget(self.status)
+        self._say("Role and Description are edited in place. In the Actual set column, "
+                  "double-click (or press Enter) to choose included roles and users.")
+        scene.rolesChanged.connect(self.schedule_refresh)
+        self.refresh()
+
+    # ---- helpers ---------------------------------------------------------------- #
+    def _button(self, text: str, tip: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setToolTip(tip)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.clicked.connect(lambda _=False: slot())
+        return b
+
+    def _say(self, text: str, error: bool = False) -> None:
+        self.status.setStyleSheet("color: #b3261e;" if error else "color: #6b7380;")
+        self.status.setText(text)
+
+    def _current_name(self):
+        row = self.table.currentRow()
+        return self._names[row] if 0 <= row < len(self._names) else None
+
+    def _update_buttons(self) -> None:
+        has = self._current_name() is not None
+        self.b_del.setEnabled(has)
+        self.b_members.setEnabled(has)
+
+    def schedule_refresh(self) -> None:
+        self._timer.start(0)
+
+    def _flush(self) -> None:
+        if self.table.editing():             # never pull the editor away from under the user
+            self._timer.start(100)
+            return
+        self.refresh()
+
+    # ---- showing the dictionary -------------------------------------------------- #
+    def refresh(self, select: "str | None" = None) -> None:
+        roles = self.scene.roles
+        t = self.table
+        if select is None:
+            select = self._current_name()
+        self._building = True
+        try:
+            t.clearContents()
+            t.setRowCount(len(roles))
+            self._names = roles.names()
+            for i, r in enumerate(roles):
+                t.setItem(i, RCOL_NAME, QTableWidgetItem(r.name))
+                t.setItem(i, RCOL_DESC, QTableWidgetItem(r.description))
+                cell = QTableWidgetItem(roles.members_text(r.name))
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                everyone = roles.effective_users(r.name)
+                cell.setToolTip("All users: " + (", ".join(everyone) if everyone else "(none)")
+                                + "\n[Name] = an included role. Double-click to edit.")
+                t.setItem(i, RCOL_SET, cell)
+        finally:
+            self._building = False
+        if select in self._names:
+            t.setCurrentCell(self._names.index(select), RCOL_NAME)
+        self._update_buttons()
+
+    # ---- editing --------------------------------------------------------------------- #
+    def _on_item_changed(self, item) -> None:
+        if self._building:
+            return
+        row, col = item.row(), item.column()
+        if not 0 <= row < len(self._names):
+            return
+        name = self._names[row]
+        if col == RCOL_NAME:
+            if item.text() == name:
+                return
+            try:
+                new = self.scene.rename_role(name, item.text())
+            except ValueError as exc:
+                self._say(str(exc), error=True)
+                self.schedule_refresh()           # puts the old name back
+                return
+            self._say(f"Renamed to “{new}”.")
+        elif col == RCOL_DESC:
+            self.scene.set_role_description(name, item.text())
+
+    def _on_double_click(self, row: int, col: int) -> None:
+        if col == RCOL_SET:
+            self.edit_members()
+
+    def add_role(self) -> None:
+        self.table.setFocus()                     # commits a cell being edited
+        role = self.scene.add_role()
+        self.refresh(select=role.name)
+        item = self.table.item(self._names.index(role.name), RCOL_NAME)
+        self.table.editItem(item)                 # type the name at once
+        self._say("Type the name of the new role.")
+
+    def delete_role(self) -> None:
+        name = self._current_name()
+        if name is None:
+            return
+        used = self.scene.role_usage(name)
+        parents = [r.name for r in self.scene.roles if name in r.roles]
+        lines = [f"Delete the role “{name}”?"]
+        if used:
+            lines.append(f"It is chosen in {used} set(s) of process tables; "
+                         "the Role cell of those sets will be emptied.")
+        if parents:
+            lines.append("It will be removed from the actual set of: " + ", ".join(parents) + ".")
+        answer = QMessageBox.question(
+            self, "Delete role", "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.scene.delete_role(name)
+        self._say(f"Deleted “{name}”.")
+
+    def edit_members(self) -> None:
+        name = self._current_name()
+        role = self.scene.roles.find(name) if name is not None else None
+        if role is None:
+            return
+        dlg = MembersDialog(self.scene.roles, role, self)
+        if not dlg.exec():                        # 1 = accepted
+            return
+        users, included = dlg.members()
+        try:
+            self.scene.set_role_members(name, users, included)
+        except ValueError as exc:
+            self._say(str(exc), error=True)
+            return
+        self._say(f"Updated the actual set of “{name}”.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2672,6 +3364,7 @@ class MainWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.setCentralWidget(self.splitter)
         self.file_path: Path | None = None
+        self.roles_window: RolesWindow | None = None   # created on first use
 
         self.hint_label = QLabel()
         self.statusBar().addPermanentWidget(self.hint_label)
@@ -2685,6 +3378,8 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._on_selection_changed)
         self.scene.contentChanged.connect(self.panel.on_content_changed)
         self.scene.contentChanged.connect(self.files_panel.on_content_changed)
+        self.scene.rolesChanged.connect(self.panel.on_content_changed)
+        self.panel.rolesRequested.connect(self.show_roles)
         self.splitter.splitterMoved.connect(self._remember_panel_height)
 
         self._on_mode_changed(MODE_SELECT)
@@ -2723,6 +3418,7 @@ class MainWindow(QMainWindow):
                               QKeySequence.StandardKey.SelectAll)
         self.a_reset_route = S("Reset connection &routing",
                                self.scene.reset_selected_routes, "Ctrl+R")
+        self.a_roles = S("Roles &dictionary\u2026", self.show_roles, "Ctrl+Shift+R")
 
         self.a_zoom_in = S("Zoom &in", lambda: self.view.zoom(1.25),
                            QKeySequence.StandardKey.ZoomIn)
@@ -2763,6 +3459,8 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("&Edit")
         for a in (self.a_edit, self.a_delete, self.a_reset_route, self.a_select_all):
             m.addAction(a)
+        m.addSeparator()
+        m.addAction(self.a_roles)
         m.addSeparator()
         for a in self.mode_actions.values():
             m.addAction(a)
@@ -2816,6 +3514,14 @@ class MainWindow(QMainWindow):
                                    + [h if w is shown else 0
                                       for w in (self.panel, self.files_panel)])
         QTimer.singleShot(0, lambda: self._reveal(sel))
+
+    def show_roles(self) -> None:
+        """Open (or bring to the front) the separate Roles dictionary window."""
+        if self.roles_window is None:
+            self.roles_window = RolesWindow(self.scene, self)
+        self.roles_window.show()
+        self.roles_window.raise_()
+        self.roles_window.activateWindow()
 
     def _reveal(self, item) -> None:
         """Scroll so that the selected item is not hidden behind the panel."""
@@ -2959,6 +3665,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
             self.scene.store.cleanup()       # delete the session copies of attachments
+            if self.roles_window is not None:
+                self.roles_window.close()
             event.accept()
         else:
             event.ignore()
