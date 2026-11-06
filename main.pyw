@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Process Diagram Editor
-======================
+VisiBPM
+=======
 
 A small desktop application (Python + PySide6) for drawing business process
 diagrams from a deliberately limited set of primitives:
@@ -74,13 +74,12 @@ Usage
     roles of the dictionary (one list per set).
   * Ctrl + mouse wheel zooms, middle mouse button pans, Esc cancels.
   * File > Save / Open: a diagram is stored as a tar archive with the
-    extension .bpmn. It contains diagram.json (the diagram and the roles
+    extension .bpx. It contains diagram.json (the diagram and the roles
     dictionary) and, for every attachment,
-    attachments/<document id>/<file name>. (Plain .json diagrams written by
-    earlier versions can still be opened.) PNG and SVG export included.
+    attachments/<document id>/<file name>. PNG and SVG export included.
   * Besides files, a document can carry web links (Add link... in the panel
     under the diagram: a Description and the URL). They are listed with the
-    files, opened with a double-click, and stored in the .bpmn file too. A
+    files, opened with a double-click, and stored in the .bpx file too. A
     document with at least one file or link shows the paper clip.
   * File > Reports exports two reports, as an HTML page or a CSV table:
       Roles      every role with its description, assigned roles and users
@@ -171,7 +170,7 @@ try:  # QtSvg ships with the regular PySide6 wheels, but stay defensive
 except ImportError:  # pragma: no cover
     QSvgGenerator = None
 
-APP_NAME = "Process Diagram Editor"
+APP_NAME = "VisiBPM"
 APP_ICON_PNG = (          # the application / window icon, 64 x 64 PNG (base64)
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAA"
     "DsMAAA7DAcdvqGQAAAAZdEVYdFNvZnR3YXJlAFBhaW50Lk5FVCA1LjEuMTITAUd0AAAAuGVYSWZJSSoACAAAAAUAGgEFAAEA"
@@ -220,10 +219,10 @@ APP_ICON_PNG = (          # the application / window icon, 64 x 64 PNG (base64)
     "LAZCDEwJJD0ncOGJn04nLuMqBgBAcOsvz0p0tdxlqHiNy9td/jDyoxCCLCtxhIvLGovnL1uWXT/uGEpuDwidJJLSziozs0Yh"
     "UudhApSdx0BI5JmnhTP7yJEjR44cOXLkyJEjR47/W/4JIueqE4baKfoAAAAASUVORK5CYII="
 )
-FILE_EXT = ".bpmn"
+FILE_EXT = ".bpx"
 REPORT_FILTER = "HTML page (*.html);;CSV table for Excel (*.csv)"
-FILE_FILTER = "Business process diagram (*.bpmn)"
-OPEN_FILTER = "Business process diagram (*.bpmn *.json)"   # .json: legacy files
+FILE_FILTER = "Business process diagram (*.bpx)"
+OPEN_FILTER = FILE_FILTER
 
 # --------------------------------------------------------------------------- #
 # Constants / look & feel
@@ -1165,7 +1164,7 @@ def write_text_atomic(path, text: str, encoding: str) -> None:
 
 
 
-# attachments-begin  (files and the .bpmn archive, no widgets - see tests)
+# attachments-begin  (files and the .bpx archive, no widgets - see tests)
 ARCHIVE_JSON = "diagram.json"          # the diagram inside the tar archive
 ARCHIVE_DIR = "attachments"            # attachments/<document id>/<file name>
 MAX_JSON_BYTES = 64 * 1024 * 1024      # refuse absurdly large diagram.json files
@@ -1235,7 +1234,7 @@ class AttachmentStore:
 
     def _new_path(self, name: str) -> Path:
         if self.root is None or not self.root.is_dir():
-            self.root = Path(tempfile.mkdtemp(prefix="bpmn-files-"))
+            self.root = Path(tempfile.mkdtemp(prefix="bpx-files-"))
         self._count += 1
         return self.root / f"{self._count:06d}_{safe_filename(name)}"
 
@@ -1288,7 +1287,7 @@ def _plain_owner(info):
 
 
 def write_archive(path, data: dict, files: dict) -> None:
-    """Write the .bpmn tar archive: diagram.json plus `files`
+    """Write the .bpx tar archive: diagram.json plus `files`
     (archive member name -> path of the file to store). The target is replaced
     only when everything was written, so a failure cannot damage it."""
     path = Path(path)
@@ -1326,7 +1325,7 @@ def referenced_members(data) -> list[str]:
 
 
 def read_archive(path, store: AttachmentStore):
-    """Read a .bpmn archive (or a legacy plain-JSON diagram).
+    """Read a .bpx archive (or a legacy plain-JSON diagram).
     Returns (diagram dict, {archive member name: path of the extracted copy}).
 
     Nothing is ever extracted to a path taken from the archive: only the
@@ -2217,7 +2216,7 @@ class DiagramScene(QGraphicsScene):
         self.exporting = False
         self.dirty = False
         self.store = AttachmentStore()      # private copies of the attached files
-        self.roles = RoleDictionary()       # saved in the .bpmn file
+        self.roles = RoleDictionary()       # saved in the .bpx file
         self._pending: NodeItem | None = None
         self._rubber: QGraphicsPathItem | None = None
         self._press_scene_pos = QPointF()
@@ -3755,7 +3754,7 @@ class DocumentFilesPanel(QWidget):
         self.title.setStyleSheet("font-weight: bold;")
         self.hint = QLabel("Add files attaches copies of files, Add link a web address "
                            "(double-click a link to open it). Everything is stored inside "
-                           "the .bpmn file when the diagram is saved.")
+                           "the .bpx file when the diagram is saved.")
         self.hint.setStyleSheet("color: #6b7380;")
         self.b_add = self._button(
             "Add files...", "Attach files to the document", self.add_files)
@@ -4326,7 +4325,7 @@ class MainWindow(QMainWindow):
                 "missing from the archive and were skipped.")
 
     def save_file(self) -> bool:
-        # a legacy .json diagram is saved as a new .bpmn file
+        # a file with another extension is saved as a new .bpx file
         if self.file_path is None or self.file_path.suffix.lower() != FILE_EXT:
             return self.save_file_as()
         return self._write(self.file_path)
@@ -4338,8 +4337,7 @@ class MainWindow(QMainWindow):
             return False
         path = Path(name)
         if path.suffix.lower() != FILE_EXT:
-            path = (path.with_suffix(FILE_EXT) if path.suffix.lower() in ("", ".json")
-                    else path.with_name(path.name + FILE_EXT))
+            path = path.with_name(path.name + FILE_EXT)
         return self._write(path)
 
     def _write(self, path: Path) -> bool:
@@ -4443,7 +4441,7 @@ def _set_windows_app_id() -> None:
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "ProcessDiagramEditor.App")
+            "VisiBPM.App")
     except Exception:                     # purely cosmetic - never stop the program
         pass
 
