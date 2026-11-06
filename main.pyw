@@ -13,6 +13,9 @@ diagrams from a deliberately limited set of primitives:
                 resized, and its name is written beside it, on the side
                 opposite to the connection (right-aligned for an output,
                 left-aligned for an input).
+  * Comment   - a plain text block: no border, no fill, sized by its text.
+                It cannot be connected to or from anything, and its text can
+                never be empty (an empty text becomes "Undef").
 
 Rules enforced by the editor
   * A process may have any number of inputs and outputs.
@@ -35,7 +38,7 @@ Usage
   * Pick a tool in the toolbar (or press its key):
         V  Select / move / resize        P  Add process
         D  Add document                  E  Add external process
-        C  Connect
+        T  Add text comment              C  Connect
   * Select tool: click to select, drag to move, drag the square handles to
     resize, double-click (or F2) to rename, Delete to remove.
     Rubber-band on empty canvas selects several items.
@@ -75,12 +78,24 @@ Usage
     dictionary) and, for every attachment,
     attachments/<document id>/<file name>. (Plain .json diagrams written by
     earlier versions can still be opened.) PNG and SVG export included.
+  * Besides files, a document can carry web links (Add link... in the panel
+    under the diagram: a Description and the URL). They are listed with the
+    files, opened with a double-click, and stored in the .bpmn file too. A
+    document with at least one file or link shows the paper clip.
+  * File > Reports exports two reports, as an HTML page or a CSV table:
+      Roles      every role with its description, assigned roles and users
+      Documents  every document that connects processes: its author role (and
+                 that role's users), the process it comes from, the term given
+                 and the documents it is based on - all read from the process
+                 tables - plus the processes it is passed to.
 
 Requirements:  pip install PySide6
 """
 from __future__ import annotations
 
 import atexit
+import csv
+import html
 import io
 import itertools
 import json
@@ -92,15 +107,18 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QBrush,
     QColor,
     QCursor,
+    QDesktopServices,
     QFontMetricsF,
     QIcon,
     QImage,
@@ -121,6 +139,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsScene,
@@ -152,6 +171,7 @@ except ImportError:  # pragma: no cover
 
 APP_NAME = "Process Diagram Editor"
 FILE_EXT = ".bpmn"
+REPORT_FILTER = "HTML page (*.html);;CSV table for Excel (*.csv)"
 FILE_FILTER = "Business process diagram (*.bpmn)"
 OPEN_FILTER = "Business process diagram (*.bpmn *.json)"   # .json: legacy files
 
@@ -164,10 +184,17 @@ HANDLE = 9            # visual size of a resize handle (px)
 HANDLE_HIT = 13       # clickable size of a resize handle (px)
 EAR = 18              # size of the dog-ear on documents
 
-PROCESS, DOCUMENT, EXTERNAL = "process", "document", "external"
+PROCESS, DOCUMENT, EXTERNAL, COMMENT = "process", "document", "external", "comment"
 MODE_SELECT, MODE_PROCESS, MODE_DOCUMENT, MODE_CONNECT = (
     "select", "process", "document", "connect")
 MODE_EXTERNAL = "external"
+MODE_COMMENT = "comment"
+UNDEF_TEXT = "Undef"      # what a text comment shows when its text is empty
+
+
+def comment_text(text) -> str:
+    """The text of a comment: one line, and never empty (it would be invisible)."""
+    return " ".join(str(text).split()) or UNDEF_TEXT
 
 C_OUTLINE = QColor("#2f3b4c")
 C_ACCENT = QColor("#1f78e0")
@@ -897,6 +924,170 @@ class RoleDictionary:
         return result
 # roles-end
 
+# reports-begin  (pure data, no widgets - see tests)
+class Report:
+    """A table ready to be written out: a title, column headers, rows of text
+    and an optional explanatory note."""
+
+    def __init__(self, title: str, headers, rows, note: str = ""):
+        self.title = title
+        self.headers = tuple(headers)
+        self.rows = [tuple(r) for r in rows]
+        self.note = note
+
+
+def _one_line(text) -> str:
+    return " ".join(str(text).split())
+
+
+def roles_report(roles: RoleDictionary) -> Report:
+    """Every role: description, the roles and users assigned to it directly,
+    and everybody who ends up in it (users of the assigned roles included)."""
+    rows = []
+    for r in roles:
+        rows.append((r.name, _one_line(r.description), ", ".join(r.roles),
+                     ", ".join(r.users), ", ".join(roles.effective_users(r.name))))
+    return Report(
+        "Roles",
+        ("Role", "Description", "Assigned roles", "Assigned users",
+         "All users (including the users of assigned roles)"),
+        rows)
+
+
+def documents_report(nodes, roles: RoleDictionary) -> Report:
+    """The documents that circulate between processes.
+
+    One row per (document, process it comes from, set of the process table that
+    lists it as an output). A set gives the author role, the term and the
+    documents the work is based on (the inputs of the same set). A document the
+    table does not describe yet still gets a row, with those cells empty."""
+    docs = [n for n in nodes if n.KIND == DOCUMENT]
+    procs = [n for n in nodes if n.KIND == PROCESS]
+    exts = [n for n in nodes if n.KIND == EXTERNAL]
+    label: dict[int, str] = {}
+    for group, suffix in ((docs, ""), (procs, ""), (exts, " (external process)")):
+        for n, text in zip(group, unique_labels(group)):
+            label[id(n)] = text + suffix
+
+    rows = []
+    for doc in sorted((d for d in docs if d.connections),
+                      key=lambda d: (label[id(d)].casefold(), label[id(d)])):
+        conns = sorted(doc.connections, key=lambda c: c.seq)
+        makers = [c.source for c in conns if c.target is doc]
+        users_of = [c.target for c in conns if c.source is doc]
+        passed_to = ", ".join(label[id(p)] for p in users_of)
+        if not makers:
+            rows.append((label[id(doc)], "", "", "(no source process)", "", "", "", passed_to))
+        for maker in sorted(makers, key=lambda p: (label[id(p)].casefold(), label[id(p)])):
+            sets = ([st for st in maker.table if any(r.out is doc for r in st.rows)]
+                    if maker.KIND == PROCESS else [])
+            if not sets:
+                rows.append((label[id(doc)], "", "", label[id(maker)], "", "", "", passed_to))
+            for st in sets:
+                inputs: list = []
+                for r in st.rows:
+                    if r.inp is not None and r.inp not in inputs:
+                        inputs.append(r.inp)
+                role = _one_line(st.role)
+                rows.append((
+                    label[id(doc)], role,
+                    ", ".join(roles.effective_users(role)) if roles.has(role) else "",
+                    label[id(maker)], _one_line(st.process), _one_line(st.term),
+                    ", ".join(label[id(d)] for d in inputs), passed_to))
+    return Report(
+        "Documents",
+        ("Document", "Author (role)", "Users of the role", "From process", "Activity",
+         "Term", "Based on documents", "Passed to"),
+        rows,
+        "Author, activity, term and source documents come from the process tables. "
+        "A row with those cells empty means the table of that process does not "
+        "describe the document yet.")
+
+
+def csv_safe(value: str) -> str:
+    """Keep spreadsheet programs from running a cell that starts like a formula."""
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+def report_csv(report: Report) -> str:
+    """The report as CSV text: ';' separated (what Excel expects in most of
+    Europe), CRLF line ends. Write it as UTF-8 with a BOM."""
+    buf = io.StringIO(newline="")
+    out = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    out.writerow([csv_safe(h) for h in report.headers])
+    for row in report.rows:
+        out.writerow([csv_safe(c) for c in row])
+    return buf.getvalue()
+
+
+REPORT_CSS = """
+body { font: 14px/1.45 "Segoe UI", system-ui, sans-serif; color: #1b1f27; margin: 32px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+.meta { color: #6b7380; margin-bottom: 18px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #cfd5de; padding: 6px 10px; text-align: left; vertical-align: top; }
+th { background: #eef2f7; }
+tbody tr:nth-child(even) { background: #f8fafc; }
+td.empty { color: #aab1bd; text-align: center; }
+.note { color: #6b7380; margin-top: 14px; }
+@media print { body { margin: 10mm; } th { background: #eee !important; } }
+"""
+
+
+def report_html(report: Report, source_name: str, when: str) -> str:
+    """The report as one self-contained HTML page (everything is escaped)."""
+    e = html.escape
+    head = "".join(f"<th>{e(h)}</th>" for h in report.headers)
+    body = []
+    for row in report.rows:
+        cells = "".join(f"<td>{e(c)}</td>" if c else '<td class="empty">&mdash;</td>'
+                        for c in row)
+        body.append(f"<tr>{cells}</tr>")
+    if not body:
+        body.append(f'<tr><td class="empty" colspan="{len(report.headers)}">'
+                    "Nothing to report</td></tr>")
+    note = f'<p class="note">{e(report.note)}</p>' if report.note else ""
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>{e(report.title)} – {e(source_name)}</title>\n"
+        f"<style>{REPORT_CSS}</style>\n</head>\n<body>\n"
+        f"<h1>{e(report.title)}</h1>\n"
+        f'<div class="meta">Diagram: {e(source_name)} · {e(when)} · '
+        f"{len(report.rows)} row(s)</div>\n"
+        f"<table>\n<thead><tr>{head}</tr></thead>\n<tbody>\n" + "\n".join(body) +
+        f"\n</tbody>\n</table>\n{note}\n</body>\n</html>\n")
+
+
+def report_target(path, selected_filter: str = ""):
+    """Where and in which format to write a report: (path, 'csv' | 'html').
+    The extension typed by the user decides; without a known one the chosen
+    filter does, and its extension is appended."""
+    path = Path(path)
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        return path, "csv"
+    if ext in (".html", ".htm"):
+        return path, "html"
+    fmt = "csv" if "csv" in selected_filter.lower() else "html"
+    return path.with_name(path.name + "." + fmt), fmt
+
+
+def write_text_atomic(path, text: str, encoding: str) -> None:
+    """Write `text` so that an existing file is replaced only on success."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+# reports-end
+
 
 
 # attachments-begin  (files and the .bpmn archive, no widgets - see tests)
@@ -1103,6 +1294,57 @@ def read_archive(path, store: AttachmentStore):
         for p in extracted:
             store.discard(p)
         raise
+
+LINK_SCHEMES = ("http", "https", "ftp", "mailto")   # the only kinds of address we accept / open
+MAX_URL_LEN = 2048
+MAX_LINK_DESC = 300
+
+
+class Link:
+    """A web address attached to a document, with a short description."""
+
+    __slots__ = ("description", "url")
+
+    def __init__(self, description: str, url: str):
+        self.description = description
+        self.url = url
+
+
+def normalize_url(text) -> str:
+    """Check an address typed by the user and return it ready to store: an
+    address without a scheme ("example.com/x") becomes https://. Raises
+    ValueError with a message for the user. Only http, https, ftp and mailto
+    are accepted - never file:, javascript: and the like, because the link is
+    handed to the operating system when it is opened."""
+    url = str(text).strip()
+    if not url:
+        raise ValueError("Enter the address of the link.")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        raise ValueError("The address must not contain spaces or control characters.")
+    if len(url) > MAX_URL_LEN:
+        raise ValueError(f"The address is too long (more than {MAX_URL_LEN} characters).")
+    if "://" not in url and not url.lower().startswith("mailto:"):
+        url = "https://" + url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port                                   # raises ValueError if it is not a number
+    except ValueError:
+        raise ValueError("This is not a valid address.") from None
+    scheme = parts.scheme.lower()
+    if scheme not in LINK_SCHEMES:
+        raise ValueError("Only http, https, ftp and mailto addresses are supported.")
+    if scheme == "mailto":
+        if not parts.path:
+            raise ValueError("The e-mail address is missing.")
+    elif not parts.hostname:
+        raise ValueError("The address has no host name.")
+    return url
+
+
+def link_text(link: Link) -> str:
+    """How a link is listed next to the attached files."""
+    return (f"Link: {link.description}    ({link.url})" if link.description
+            else f"Link: {link.url}")
 # attachments-end
 
 
@@ -1118,6 +1360,7 @@ class NodeItem(QGraphicsItem):
     NAME = "item"
     IS_DOC = False        # documents link to processes, everything else to documents
     RESIZABLE = True
+    CONNECTABLE = True    # False: connections to or from it are refused (text comment)
     SNAP = GRID           # position snaps to multiples of this (see ExternalItem)
 
     def __init__(self, x: float, y: float, w: float, h: float, text: str = ""):
@@ -1415,6 +1658,7 @@ class DocumentItem(NodeItem):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.attachments: list[Attachment] = []   # listed in the panel under the diagram
+        self.links: list[Link] = []               # ... together with the web links
 
     def attach(self, src, store: AttachmentStore) -> Attachment:
         """Attach a copy of the file `src` (raises OSError if it cannot be read)."""
@@ -1430,14 +1674,31 @@ class DocumentItem(NodeItem):
         store.discard(att.path)
         self.attachments_changed()
 
+    def add_link(self, description: str, url: str) -> Link:
+        link = Link(description, url)
+        self.links.append(link)
+        self.attachments_changed()
+        return link
+
+    def set_link(self, index: int, description: str, url: str) -> None:
+        self.links[index].description = description
+        self.links[index].url = url
+        self.attachments_changed()
+
+    def remove_link(self, index: int) -> None:
+        del self.links[index]
+        self.attachments_changed()
+
     def attachments_changed(self) -> None:
-        n = len(self.attachments)
-        self.setToolTip(f"{n} attached file{'' if n == 1 else 's'}" if n else "")
+        n, m = len(self.attachments), len(self.links)
+        parts = ([f"{n} attached file{'' if n == 1 else 's'}"] if n else []) + \
+                ([f"{m} link{'' if m == 1 else 's'}"] if m else [])
+        self.setToolTip(", ".join(parts))
         self.update()
 
     def draw_label(self, painter: QPainter) -> None:
         super().draw_label(painter)
-        if self.attachments:                       # paper clip, lower right corner
+        if self.attachments or self.links:         # paper clip, lower right corner
             r = self._rect
             painter.save()
             painter.translate(r.right() - 17, r.bottom() - 22)
@@ -1460,6 +1721,8 @@ class DocumentItem(NodeItem):
                 if files is not None:
                     files[member] = a.path
             d["attachments"] = entries
+        if self.links:
+            d["links"] = [{"description": k.description, "url": k.url} for k in self.links]
         return d
 
     def ear(self) -> float:
@@ -1568,7 +1831,90 @@ class ExternalItem(NodeItem):
         painter.restore()
 
 
-NODE_CLASSES = {PROCESS: ProcessItem, DOCUMENT: DocumentItem, EXTERNAL: ExternalItem}
+class CommentItem(NodeItem):
+    """A text comment: just a line of text. No border, no fill, no resize
+    handles and no connections. The size follows the text, which can never be
+    empty - an empty text is replaced by "Undef", so the item cannot vanish."""
+
+    KIND = COMMENT
+    NAME = "text comment"
+    DEFAULT_SIZE = (60, 24)
+    RESIZABLE = False
+    CONNECTABLE = False
+    SNAP = GRID / 2
+    PAD = 3.0                          # space around the text (the clickable area)
+
+    def __init__(self, x: float, y: float, w: float = 0, h: float = 0,
+                 text: str = ""):
+        super().__init__(x, y, 1, 1, text)      # the real size comes from the text
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    @text.setter
+    def text(self, value) -> None:
+        self._text = comment_text(value)
+        self._fit()
+
+    def _fit(self) -> None:
+        fm = QFontMetricsF(QApplication.font())
+        w = math.ceil(fm.horizontalAdvance(self._text)) + 2 * self.PAD
+        h = math.ceil(fm.height()) + 2 * self.PAD
+        self.prepareGeometryChange()
+        self._rect = QRectF(0, 0, w, h)
+        self.update()
+
+    def can_accept_connection(self) -> bool:
+        return False
+
+    def min_height(self) -> float:
+        return self._rect.height()
+
+    def ensure_ports_fit(self, snap: bool = True) -> None:
+        pass                           # has no ports
+
+    def refresh_geometry(self) -> None:
+        self._fit()
+
+    def boundingRect(self) -> QRectF:
+        return self._rect.adjusted(-2, -2, 2, 2)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addRect(self._rect.adjusted(-2, -2, 2, 2))
+        return path
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.isSelected():          # no border of its own: only mark the selection
+            painter.setPen(QPen(C_ACCENT, 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._rect.adjusted(-1, -1, 1, 1))
+        opt = QTextOption(Qt.AlignmentFlag.AlignCenter)
+        opt.setWrapMode(QTextOption.WrapMode.NoWrap)
+        painter.setFont(QApplication.font())
+        painter.setPen(C_TEXT)
+        painter.drawText(self._rect, self._text, opt)
+
+    def edit_text(self) -> None:
+        sc = self.scene()
+        views = sc.views() if sc else []
+        text, ok = QInputDialog.getText(
+            views[0] if views else None, "Text comment",
+            f"Enter the text of this comment (an empty text becomes \u201c{UNDEF_TEXT}\u201d):",
+            QLineEdit.EchoMode.Normal, self._text)
+        if not ok:
+            return
+        new = comment_text(text)
+        if new != self._text:
+            self.text = new
+            if sc:
+                sc.touch()
+
+
+NODE_CLASSES = {PROCESS: ProcessItem, DOCUMENT: DocumentItem, EXTERNAL: ExternalItem,
+                COMMENT: CommentItem}
 
 
 # --------------------------------------------------------------------------- #
@@ -1891,8 +2237,10 @@ class DiagramScene(QGraphicsScene):
     def add_node(self, kind: str, center: QPointF, text: str = "") -> NodeItem:
         cls = NODE_CLASSES[kind]
         w, h = cls.DEFAULT_SIZE
-        p = self.snap_point(QPointF(center.x() - w / 2, center.y() - h / 2), cls.SNAP)
-        item = cls(p.x(), p.y(), w, h, text)
+        item = cls(0, 0, w, h, text)
+        size = item._rect                     # (a comment is sized by its text)
+        item.setPos(self.snap_point(QPointF(center.x() - size.width() / 2,
+                                            center.y() - size.height() / 2), cls.SNAP))
         self.addItem(item)
         self.clearSelection()
         item.setSelected(True)
@@ -1903,6 +2251,10 @@ class DiagramScene(QGraphicsScene):
         """Validate and create a connection a -> b. Reports problems via `message`."""
         if a is b:
             return None
+        for node in (a, b):
+            if not node.CONNECTABLE:
+                self.message.emit(f"A {node.NAME} cannot be connected to anything.", True)
+                return None
         if a.IS_DOC == b.IS_DOC:
             if a.IS_DOC:
                 msg = ("Documents cannot be connected to each other - "
@@ -2014,6 +2366,9 @@ class DiagramScene(QGraphicsScene):
 
     # ---- pending connection (rubber band) ---------------------------------- #
     def begin_connect(self, node: NodeItem, pos: QPointF) -> None:
+        if not node.CONNECTABLE:
+            self.message.emit(f"A {node.NAME} cannot be connected to anything.", True)
+            return
         if not node.can_accept_connection():
             self.message.emit(f"The {node.display_name()} already has its "
                               "only connection.", True)
@@ -2071,10 +2426,10 @@ class DiagramScene(QGraphicsScene):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         pos = event.scenePos()
-        if self.mode in (MODE_PROCESS, MODE_DOCUMENT, MODE_EXTERNAL):
+        if self.mode in (MODE_PROCESS, MODE_DOCUMENT, MODE_EXTERNAL, MODE_COMMENT):
             item = self.add_node(
                 {MODE_PROCESS: PROCESS, MODE_DOCUMENT: DOCUMENT,
-                 MODE_EXTERNAL: EXTERNAL}[self.mode], pos)
+                 MODE_EXTERNAL: EXTERNAL, MODE_COMMENT: COMMENT}[self.mode], pos)
             self.set_mode(MODE_SELECT)
             item.edit_text()          # ask for the name straight away
         elif self.mode == MODE_CONNECT:
@@ -2181,6 +2536,8 @@ class DiagramScene(QGraphicsScene):
         conns = []
         for cd in data.get("connections", []):
             a, b = by_id[cd["source"]], by_id[cd["target"]]
+            if not (a.CONNECTABLE and b.CONNECTABLE):
+                raise ValueError("File contains a connection to a text comment.")
             if a.IS_DOC == b.IS_DOC:
                 raise ValueError("File contains an illegal connection between "
                                  f"two {a.KIND}s.")
@@ -2211,6 +2568,19 @@ class DiagramScene(QGraphicsScene):
                 name = unique_name(safe_filename(e.get("name") or posixpath.basename(member)),
                                    [a.name for a in node.attachments])
                 node.attachments.append(Attachment(name, src))
+            node.attachments_changed()
+        for nd in data["nodes"]:                 # web links of the documents
+            node = by_id[nd["id"]]
+            entries = nd.get("links")
+            if not isinstance(node, DocumentItem) or not isinstance(entries, list):
+                continue
+            for e in entries:
+                url = e.get("url") if isinstance(e, dict) else None
+                if not isinstance(url, str) or not url.strip():
+                    continue
+                desc = e.get("description")
+                node.links.append(Link(_one_line(desc)[:MAX_LINK_DESC]
+                                       if isinstance(desc, str) else "", url.strip()))
             node.attachments_changed()
         roles = RoleDictionary.from_list(data.get("roles"))
         # Everything parsed fine - now replace the current diagram.
@@ -3144,23 +3514,91 @@ class FileList(QListWidget):
         super().keyPressEvent(e)
 
 
+class LinkDialog(QDialog):
+    """The small window for a link: a Description and the URL itself. OK stays
+    disabled until the URL is acceptable; the problem is shown under the fields."""
+
+    def __init__(self, description: str = "", url: str = "", editing: bool = False,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit link" if editing else "Add link")
+        self.setModal(True)
+        self.resize(520, 160)
+        self.desc_edit = QLineEdit()
+        self.desc_edit.setPlaceholderText("What the link is about (optional)")
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://example.com/page")
+        self.desc_edit.setText(description)
+        self.url_edit.setText(url)
+        self.problem = QLabel()
+        self.problem.setStyleSheet("color: #b3261e;")
+        self.problem.setWordWrap(True)
+        form = QFormLayout()
+        form.addRow("Description:", self.desc_edit)
+        form.addRow("URL:", self.url_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(self.problem)
+        lay.addStretch(1)
+        lay.addWidget(buttons)
+        self.url_edit.textChanged.connect(lambda *_: self._check())
+        self._check()
+        self.desc_edit.setFocus()
+
+    def _check(self) -> bool:
+        text = self.url_edit.text()
+        try:
+            normalize_url(text)
+        except ValueError as exc:
+            self.ok_button.setEnabled(False)
+            self.problem.setText(str(exc) if text.strip() else "")
+            return False
+        self.ok_button.setEnabled(True)
+        self.problem.setText("")
+        return True
+
+    def accept(self) -> None:
+        if self._check():                    # (Enter must not get past a bad address)
+            super().accept()
+
+    def result_link(self):
+        """(description, url) as typed, tidied: one-line description and the
+        address with https:// added when it had no scheme."""
+        return (_one_line(self.desc_edit.text())[:MAX_LINK_DESC],
+                normalize_url(self.url_edit.text()))
+
+
 class DocumentFilesPanel(QWidget):
-    """Files attached to the selected document."""
+    """Files and web links attached to the selected document."""
 
     def __init__(self, scene: DiagramScene, parent=None):
         super().__init__(parent)
         self.scene = scene
         self.document: DocumentItem | None = None
+        self._entries: list[tuple[str, int]] = []      # list row -> ("file" | "link", index)
 
         self.title = QLabel()
         self.title.setStyleSheet("font-weight: bold;")
-        self.hint = QLabel("Add files attaches copies of files to the document; they are "
-                           "stored inside the .bpmn file when the diagram is saved.")
+        self.hint = QLabel("Add files attaches copies of files, Add link a web address "
+                           "(double-click a link to open it). Everything is stored inside "
+                           "the .bpmn file when the diagram is saved.")
         self.hint.setStyleSheet("color: #6b7380;")
         self.b_add = self._button(
             "Add files...", "Attach files to the document", self.add_files)
+        self.b_link = self._button(
+            "Add link...", "Attach a web address (URL) to the document", self.add_link)
+        self.b_edit = self._button(
+            "Edit link...", "Change the description or the URL of the selected link",
+            self.edit_link)
+        self.b_open = self._button(
+            "Open link", "Open the selected link in the web browser", self.open_link)
         self.b_remove = self._button(
-            "Remove", "Detach the selected files from the document "
+            "Remove", "Detach the selected files and links from the document "
             "(the original files are not touched)", self.remove_selected)
         self.b_save = self._button(
             "Save copy...", "Write the selected attached file to disk", self.save_copy)
@@ -3168,11 +3606,12 @@ class DocumentFilesPanel(QWidget):
         lst = self.list = FileList(self)
         lst.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         lst.itemSelectionChanged.connect(self._update_buttons)
+        lst.itemDoubleClicked.connect(self._on_double_click)
         lst.removeRequested.connect(self.remove_selected)
 
         top = QHBoxLayout()
         top.addWidget(self.title, 1)
-        for b in (self.b_add, self.b_remove, self.b_save):
+        for b in (self.b_add, self.b_link, self.b_edit, self.b_open, self.b_remove, self.b_save):
             top.addWidget(b)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 4, 6, 4)
@@ -3194,16 +3633,25 @@ class DocumentFilesPanel(QWidget):
     def _selected_rows(self) -> list[int]:
         return sorted({self.list.row(it) for it in self.list.selectedItems()})
 
+    def _selected_entries(self) -> list[tuple[str, int]]:
+        return [self._entries[r] for r in self._selected_rows() if r < len(self._entries)]
+
     def _update_buttons(self) -> None:
-        n = len(self._selected_rows())
-        self.b_add.setEnabled(self.document is not None)
-        self.b_remove.setEnabled(n > 0)
-        self.b_save.setEnabled(n == 1)
+        sel = self._selected_entries()
+        one = sel[0][0] if len(sel) == 1 else None
+        has = self.document is not None
+        self.b_add.setEnabled(has)
+        self.b_link.setEnabled(has)
+        self.b_remove.setEnabled(bool(sel))
+        self.b_save.setEnabled(one == "file")
+        self.b_edit.setEnabled(one == "link")
+        self.b_open.setEnabled(one == "link")
 
     # ---- showing a document ---------------------------------------------------- #
     def set_document(self, doc) -> None:
         self.document = doc
         if doc is None:
+            self._entries = []
             self.list.clear()
             self._update_buttons()
             return
@@ -3226,15 +3674,31 @@ class DocumentFilesPanel(QWidget):
             self.set_document(None)
             return
         keep = self._selected_rows()
+        self._entries = []
         self.list.clear()
-        for a in doc.attachments:
+        for i, a in enumerate(doc.attachments):
             self.list.addItem(QListWidgetItem(f"{a.name}    ({format_size(a.size())})"))
+            self._entries.append(("file", i))
+        for i, link in enumerate(doc.links):
+            item = QListWidgetItem(link_text(link))
+            item.setToolTip(link.url)
+            self.list.addItem(item)
+            self._entries.append(("link", i))
         for r in keep:
             if r < self.list.count():
                 self.list.item(r).setSelected(True)
-        n = len(doc.attachments)
-        self.title.setText(f"Document: {plain_name(doc)}   "
-                           f"({n} file{'' if n == 1 else 's'})")
+        n, m = len(doc.attachments), len(doc.links)
+        counts = f"{n} file{'' if n == 1 else 's'}"
+        if m:
+            counts += f", {m} link{'' if m == 1 else 's'}"
+        self.title.setText(f"Document: {plain_name(doc)}   ({counts})")
+        self._update_buttons()
+
+    def _select_entry(self, kind: str, index: int) -> None:
+        for it in self.list.selectedItems():
+            it.setSelected(False)
+        if (kind, index) in self._entries:
+            self.list.item(self._entries.index((kind, index))).setSelected(True)
         self._update_buttons()
 
     # ---- actions ------------------------------------------------------------------- #
@@ -3259,22 +3723,79 @@ class DocumentFilesPanel(QWidget):
             QMessageBox.warning(self, APP_NAME, "Some files could not be attached:\n"
                                 + "\n".join(failed))
 
+    def add_link(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        dlg = LinkDialog(parent=self)
+        if not dlg.exec():                    # 1 = accepted
+            return
+        description, url = dlg.result_link()
+        doc.add_link(description, url)
+        self.scene.touch()
+        self.refresh()
+        self._select_entry("link", len(doc.links) - 1)
+
+    def _the_link(self):
+        """(index, Link) of the one selected link, else None."""
+        sel = self._selected_entries()
+        if self.document is None or len(sel) != 1 or sel[0][0] != "link":
+            return None
+        return sel[0][1], self.document.links[sel[0][1]]
+
+    def edit_link(self) -> None:
+        got = self._the_link()
+        if got is None:
+            return
+        index, link = got
+        dlg = LinkDialog(link.description, link.url, editing=True, parent=self)
+        if not dlg.exec():
+            return
+        description, url = dlg.result_link()
+        if (description, url) != (link.description, link.url):
+            self.document.set_link(index, description, url)
+            self.scene.touch()
+            self.refresh()
+
+    def open_link(self) -> None:
+        got = self._the_link()
+        if got is not None:
+            self._open(got[1])
+
+    def _open(self, link: Link) -> None:
+        try:
+            url = normalize_url(link.url)     # also keeps file:, javascript: ... from being opened
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_NAME, f"This link is not opened:\n{link.url}\n\n{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(self, APP_NAME, f"Could not open the link:\n{url}")
+
+    def _on_double_click(self, item) -> None:
+        row = self.list.row(item)
+        if self.document is not None and 0 <= row < len(self._entries):
+            kind, index = self._entries[row]
+            if kind == "link":
+                self._open(self.document.links[index])
+
     def remove_selected(self) -> None:
         doc = self.document
-        rows = self._selected_rows()
-        if doc is None or not rows:
+        sel = self._selected_entries()
+        if doc is None or not sel:
             return
-        for r in reversed(rows):              # from the end, so indexes stay valid
-            doc.detach(r, self.scene.store)
+        for index in sorted((i for k, i in sel if k == "file"), reverse=True):
+            doc.detach(index, self.scene.store)   # from the end, so indexes stay valid
+        for index in sorted((i for k, i in sel if k == "link"), reverse=True):
+            doc.remove_link(index)
         self.scene.touch()
         self.refresh()
 
     def save_copy(self) -> None:
         doc = self.document
-        rows = self._selected_rows()
-        if doc is None or len(rows) != 1:
+        sel = self._selected_entries()
+        if doc is None or len(sel) != 1 or sel[0][0] != "file":
             return
-        att = doc.attachments[rows[0]]
+        att = doc.attachments[sel[0][1]]
         dest, _filter = QFileDialog.getSaveFileName(
             self, "Save a copy of the attached file", att.name)
         if not dest:
@@ -3309,6 +3830,10 @@ def make_icon(kind: str) -> QIcon:
     elif kind == MODE_EXTERNAL:
         p.setBrush(C_EXTERNAL_FILL)
         p.drawRect(QRectF(10, 10, 12, 12))
+    elif kind == MODE_COMMENT:           # a bare "T": text with no frame
+        p.setPen(QPen(C_TEXT, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QLineF(8, 8.5, 24, 8.5))
+        p.drawLine(QLineF(16, 8.5, 16, 25))
     elif kind == MODE_DOCUMENT:
         p.setBrush(C_DOC_FILL)
         p.drawPolygon(QPolygonF([QPointF(11, 6), QPointF(27, 6), QPointF(27, 26),
@@ -3339,6 +3864,8 @@ MODE_HINTS = {
     MODE_DOCUMENT: "Click on the canvas to place a document, then type its name (Esc to cancel).",
     MODE_EXTERNAL: "Click on the canvas to place an external process (one connection only), "
                    "then type its name (Esc to cancel).",
+    MODE_COMMENT: "Click on the canvas to place a text comment (no border, cannot be "
+                  "connected), then type its text (Esc to cancel).",
     MODE_CONNECT: "Connect: drag (or click) from a process to a document "
                   "(output) or from a document to a process (input).",
 }
@@ -3409,6 +3936,8 @@ class MainWindow(QMainWindow):
                            QKeySequence.StandardKey.SaveAs)
         self.a_png = S("Export as &PNG\u2026", self.export_png)
         self.a_svg = S("Export as S&VG\u2026", self.export_svg)
+        self.a_report_roles = S("&Roles\u2026", lambda: self.export_report("roles"))
+        self.a_report_docs = S("&Documents\u2026", lambda: self.export_report("documents"))
         self.a_quit = S("&Quit", self.close, QKeySequence.StandardKey.Quit)
 
         self.a_edit = S("&Rename", self.scene.edit_selected_label, "F2")
@@ -3439,6 +3968,7 @@ class MainWindow(QMainWindow):
                 (MODE_PROCESS, "Process", "P"),
                 (MODE_DOCUMENT, "Document", "D"),
                 (MODE_EXTERNAL, "External", "E"),
+                (MODE_COMMENT, "Comment", "T"),
                 (MODE_CONNECT, "Connect", "C")):
             a = S(label, lambda _=False, m=mode: self.scene.set_mode(m), key,
                   checkable=True, icon=make_icon(mode))
@@ -3453,6 +3983,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.a_png)
         m.addAction(self.a_svg)
+        reports = m.addMenu("&Reports")
+        reports.addAction(self.a_report_roles)
+        reports.addAction(self.a_report_docs)
         m.addSeparator()
         m.addAction(self.a_quit)
 
@@ -3661,6 +4194,43 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "QtSvg is not available.")
             return
         self._export("Export SVG", "SVG image (*.svg)", ".svg", self.scene.export_svg)
+
+    def export_report(self, kind: str) -> None:
+        """File > Reports: build the report, ask where to save it, write it."""
+        if kind == "roles":
+            if not len(self.scene.roles):
+                QMessageBox.information(
+                    self, APP_NAME, "The Roles dictionary is empty - there is nothing to "
+                    "report yet.\nAdd roles with Edit > Roles dictionary.")
+                return
+            report = roles_report(self.scene.roles)
+        else:
+            report = documents_report(self.scene.nodes(), self.scene.roles)
+            if not report.rows:
+                QMessageBox.information(
+                    self, APP_NAME, "No document is connected to a process yet - there is "
+                    "nothing to report.")
+                return
+        stem = self.file_path.stem if self.file_path else "diagram"
+        start = f"{stem}-{kind}.html"
+        if self.file_path:
+            start = str(self.file_path.with_name(start))
+        name, chosen = QFileDialog.getSaveFileName(
+            self, f"Export report: {report.title}", start, REPORT_FILTER)
+        if not name:
+            return
+        path, fmt = report_target(name, chosen)
+        source = self.file_path.name if self.file_path else "Untitled"
+        try:
+            if fmt == "csv":
+                write_text_atomic(path, report_csv(report), "utf-8-sig")
+            else:
+                when = datetime.now().strftime("%Y-%m-%d %H:%M")
+                write_text_atomic(path, report_html(report, source, when), "utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not save the report:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Saved report {path}", 5000)
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
