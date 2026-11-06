@@ -21,7 +21,7 @@ Process description takes three answers:
 
 <br />
 <p align="center">
-<img width="870" height="417" alt="screenshot" src="https://github.com/user-attachments/assets/51ae358e-f3a0-4e8a-bb78-bc036e81ab2b" />
+<img width="931" height="500" alt="Clipboard_11-06-2026_01" src="https://github.com/user-attachments/assets/2007c319-74de-4f85-8d4d-d30e68d38536" />
 </p>
 
 ## Technical
