@@ -94,6 +94,7 @@ Requirements:  pip install PySide6
 from __future__ import annotations
 
 import atexit
+import base64
 import csv
 import html
 import io
@@ -153,6 +154,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QStyledItemDelegate,
@@ -170,6 +172,54 @@ except ImportError:  # pragma: no cover
     QSvgGenerator = None
 
 APP_NAME = "Process Diagram Editor"
+APP_ICON_PNG = (          # the application / window icon, 64 x 64 PNG (base64)
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAA"
+    "DsMAAA7DAcdvqGQAAAAZdEVYdFNvZnR3YXJlAFBhaW50Lk5FVCA1LjEuMTITAUd0AAAAuGVYSWZJSSoACAAAAAUAGgEFAAEA"
+    "AABKAAAAGwEFAAEAAABSAAAAKAEDAAEAAAACAAAAMQECABEAAABaAAAAaYcEAAEAAABsAAAAAAAAAGAAAAABAAAAYAAAAAEA"
+    "AABQYWludC5ORVQgNS4xLjEyAAADAACQBwAEAAAAMDIzMAGgAwABAAAAAQAAAAWgBAABAAAAlgAAAAAAAAACAAEAAgAEAAAA"
+    "Ujk4AAIABwAEAAAAMDEwMAAAAADZp5qVybcLXwAAC4lJREFUeF7tmXlwXVUdx7+/c+59W5Jm6RYgJS2QNktbErCyG5CC6ERl"
+    "wEGtZZVKGe2gggKyKDoqjIylMIhAAUNlsWixCAOlC1RpC7bpErqEFhKbhWZpyfL29+45P/+47768+5IqSp1JxveZ+U3eO+ee"
+    "8+75nvP7nfM7AXLkyJEjR44cOXLkyPH/CGUXjAee37RiantfS35cWJqFU8qpPwQiAhHg9fhEeWBmxxXnLEhkNHcx7gS4f90v"
+    "Pt8W2vP0oOovAIQGADCnBHCGY4shheE568Tz1iyovvYrEwKTohndpEnrN17ot3rv7OH3J8V0zBtD0B/jIX8UQ/4ogv4oD/kj"
+    "PJj6O+QP6iPS8sa/sO7gy6s273vNn90XxqMAwdhHUVJeEGmAtHsNk222CxDAgEokMaC7L/lHcv+q/b2bR4gw7gToirX1ERGY"
+    "AGgDpCWIh02wAbAEtAArAaWSYGjEReSSvUfeW5nd37gTgCAEEQFEw4HvKJAgBKNBJGJJxK04eri74cldyx77Od5Ir5txFwQX"
+    "vXjFmkHuuZhZgMEgzpKBGSACMQEEaJ2AlzyQpgQMATMR0AWh4yuXXfWbAwAgM9uONRpXv16YIP+s4uMrJted/qnSa0qvT7Se"
+    "tvWzhhCzCWwL4CyGlNmiZMwrAVpoWKyQtCywJZL+RN4jf1+9/QjGsgvcdMd9Fb976rl3tr7btmtv++C7TXs7d72Jd243vTIK"
+    "sD3R2Y3gBMDhQCiEAME2IQSklK6WY1aA3p6eJRt3H5p10rTj951TM+2t2TOnbz+udOoHUPbRh+0g/194sfv5MSuAIDGxNE+g"
+    "ZmbZzWv+9Nh5a1ctP73xmfsf5WjSywBYEAgEBoEhUkOxjYnBpG1LhUonThAAkSGCS462IzFz65a3y7XWICFAwjllZcNgZjCD"
+    "Yonk4Wsuv6Q/+4lPypU33rpi/ebmhfXzKhueW770Faf8+y9du6k9ceBsSBOkGZwaAlHmUDR4lPcmAjwqP14SPG7uQ9ct349M"
+    "AZbcdt+MPfvee16QrANBOQ2OKoD9QQwGw/0nl5f+7PknHng4+6lPwpU33r5iw5bmhefPq2p45vH7XwEAZjbueu27zfvC26pI"
+    "miBNwzPrEsCe85EiaJhWfrwkePzch69/Yj8yXaC1te36jS2HPr1uR4e5bnuHb932Dt/apg7f2u2dw9bU4Vvb1O5b29TpW9fU"
+    "6Vu3rcOzta1/6rbdbbcuvumWEaesTwKDADJAYthLicgajH/UJVKDRyrQuQeP4YVOMmOOCZoBzQkC4uknDefD0GDQ1MyAT44a"
+    "VgjZG65Twejsj+gX/tDoiif3vfCcuXFnwU27u5IzI/AqKazhlZOaGXvLJigSNN2fTM6bgUd/e8tluwHYAyeC0iqzW8STwX72"
+    "SJC2Uru43WdahOx3TK1iZoYWBI/0GpPyStLV6Zf+W3NbUI42cofsjlMwA8QKfp+7fPue/EXNR/J/NSALF8Vl/uIoChdHqWhx"
+    "FIWLI1S0OEJF9ncqWpygwhv2hgq/816HaEwwSwAQQkAzwVJ2wucws6TylRKempTa1CZ7lKG9ytQeZSiPMnXKOMO0V0ntVUIZ"
+    "KqD9KCuY9cal513d7vSXFqDA77GPTv8xBK0VrGSfqzSvYOK5PXECsQGhU6tHA8QEwWTnMcyAViCtEIUAGRMq/ri5Z6rdrQDI"
+    "A/fwgVsuvLex0j+nMj9YUucPFdYGwkW1gXBRbX64qDYQKqoNhAprA8EMC02oDYSKa/2hwrpSq3zuBTXzv1hXdnrM6S894gkn"
+    "nX93xPTfY7k2iWHIcYOsuMhgeFXkIHo3VseCiDjl1y3d8vTz78avNByNRwQkpIKUBhFhCMDFU2Tw+stmV11xRknXwht/tGLD"
+    "Oy0Lz60rb1j5xPAucKzJjDCuimzsWluG7BohCJdffpWr1DQNZidry/TRDJwTW+obpJQ8bVqxvQOBWSfDYGW5Gx1j0m+VP6P+"
+    "7pjHf4+F0YNgJo5qzHYAYhXaf/Xn5i2xlPETnUwoKaXq83+qakNk2hQvKxCnlnsWDIZOZTOKCBVmRM0R25oYsUjXh33V+1s7"
+    "p3zmjIqGlcsf/J+tgHQy5C2eXm9JzwUa9G8FcNUTwy+pLxmPbPvr3o6bdu5rP7H5g0PT28xpeXlFZRBKg0aOPQ2nFpVJAn3B"
+    "IbFj06sn7D7YOf3goY/yivPzMP2Eic/ubtpyILvdsSLtAnaO7a78WBBBavaaVviNyTJ0apEcqj1Fv1n5lTPnvKyUgmKGfSA9"
+    "OkSEMGvUTgmEv95wzsXoeb3i8vraV5RSsJLubfBYkx5ywYz6u6OewD0WiX85Y8hKIDQ0Ajp+sKB/Q1X3YaQvHm94aOvvnt4Z"
+    "vtrQDEBAp35JZORiDMA+zxBCMHDxcWLoB4vOqLionHqvWXJX45q3mq86r25Gw8onH3C5QM/aH38mPthawgjr7F0CqffTAMjw"
+    "ykBp1bYpZ97dkf2MQ1YydJTDzlGxn2cQApOrXH2pZNxUWgFkX1w43Wam6m4Y2krykUOHDABQWgu71P1CPa9/+8b83i0bJ4Z3"
+    "vTgpdGD1lND7q6dmmV12YPWkwT2rAtGBDT17nzzJ1UkGbgF49O0qG3Y9ag9PJYePlwAQigx25UnAEkZG5paFc4wlgtQKoWhk"
+    "yGfqAQAQJMAaYO1uZRzeOd8TPwDTOgKhByD1AIRym9QDkDwEqQ7DY/WcUhDsXDOw+9lRRUgLkFDx1FeyR+ZE+JQ5ZfaxMvXR"
+    "3q5gKY3OoS5Xx6WTfU/Oyk/uMFSkz1SRbsmxbsmxbqFj3cQp05Fu0tFu6GhPuRnqObFULL309LIInJknHrF9eqLBBGsCaQPC"
+    "uRBFhrEEswRrAcCEFAI+HTzFE25f07+jcYQIaQHKpxYaFgSgAFYMVgC0ThtrTs1Iqt6yTWuJSXk+o+Gzl7qm6oEbLmy57OyO"
+    "M04IvlY5YeDt6rxwS3VBeH91XqSlOhBpqfaH9lYHwvuq88P7qr2D+6rmTOmdufL2i5Y67Znt2ddZuQAVVJYRx8BpYTKnyRbN"
+    "9ksN0hrQEuA4vKr3FJ86vCbc+geXCGl5v7nk1vN37Wn9czCUKCSydXF8l5ldvpv+DdYgAdRVnfTAysZl3xt+4pOz4Fu3rdjw"
+    "zp6F5542o+GPT9nnAGaWoRev3eU9/GoNC78rPmSuFPv9GMwanF8GUVwKGBMAGIjD29JF08+unP/DfmRv6T+9/5Hp4aHYbK1s"
+    "71bavliwM6n0JQgkCbuMtSCh+h669863M/s5Fnz1uptX/G17y8L6eTO/8NzjS1+FLQCFVi1sNvvXz4YI2DN8lKDq3BaTUtCC"
+    "AEmATiJCk/WHvpqa2d94tgXZAowlvrbotmfW/71lwVmnln/Nl6deajoY9z748LdV/Y5fbzL6180B+UH8cc8IKTXYQsyYFD/k"
+    "nTm3csEL7guRscZQKLgjKQz8dWfb8jc3f9B+uK21s/HeJ+7wCCMElqPc9owOEaUDNggQUkIa6WuQsStA/fwLHq+fW/b7U8uL"
+    "IhVlU1TdrHIrTJ4ox/t7QSZoRKI8Osz2TkIgEAtAKygrllZvzLqAw4vrNxUMhaMkA8VcceGpVs2fr3vL6F9/moAnvVV/XARr"
+    "xGRxsrdkXt3JX16+B+NBgEyYWYRWX9lsfvR6jaQCgIezDMcl7CU/UhYiAqkE4v6TEa+57EsT6777F4xlFzgKzJyMCjbTcc2B"
+    "Mi5H7cMluwxs/89Qq6gaPPxhp9NuXAlARKwH21sF+Uad5WGy6xgMDU0EgagK9r4fcmrGlQAAYE0oYcuUICRBSAIcBzg2ikUz"
+    "LAZCDEwJJD0ncOGJn04nLuMqBgBAcOsvz0p0tdxlqHiNy9td/jDyoxCCLCtxhIvLGovnL1uWXT/uGEpuDwidJJLSziozs0Yh"
+    "UudhApSdx0BI5JmnhTP7yJEjR44cOXLkyJEjR47/W/4JIueqE4baKfoAAAAASUVORK5CYII="
+)
 FILE_EXT = ".bpmn"
 REPORT_FILTER = "HTML page (*.html);;CSV table for Excel (*.csv)"
 FILE_FILTER = "Business process diagram (*.bpmn)"
@@ -703,6 +753,30 @@ def sets_from_list(data, by_id, ins, outs) -> list:
         result.append(TableSet(str(d.get("role", "")), str(d.get("term", "")),
                                str(d.get("process", "")), rows))
     return result
+
+def multiline(text) -> str:
+    """Text that may span several lines: line ends are unified to \\n, blanks
+    inside a line are collapsed, empty lines at the ends are dropped."""
+    lines = [" ".join(ln.split()) for ln in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def fit_row_heights(spans, needs, base: int) -> list[int]:
+    """Heights of the table rows. `spans[i]` = rows of set i, `needs[i]` = the
+    height its multi-line cell wants. Every row is at least `base`; a set whose
+    cell needs more than its rows give gets the difference on its last row."""
+    heights: list[int] = []
+    for n, need in zip(spans, needs):
+        n = max(1, n)
+        heights.extend([base] * n)
+        extra = need - n * base
+        if extra > 0:
+            heights[-1] += extra
+    return heights
 # table-model-end
 
 # roles-begin  (pure data, no widgets - see tests)
@@ -992,7 +1066,7 @@ def documents_report(nodes, roles: RoleDictionary) -> Report:
                 rows.append((
                     label[id(doc)], role,
                     ", ".join(roles.effective_users(role)) if roles.has(role) else "",
-                    label[id(maker)], _one_line(st.process), _one_line(st.term),
+                    label[id(maker)], multiline(st.process), _one_line(st.term),
                     ", ".join(label[id(d)] for d in inputs), passed_to))
     return Report(
         "Documents",
@@ -1040,8 +1114,9 @@ def report_html(report: Report, source_name: str, when: str) -> str:
     head = "".join(f"<th>{e(h)}</th>" for h in report.headers)
     body = []
     for row in report.rows:
-        cells = "".join(f"<td>{e(c)}</td>" if c else '<td class="empty">&mdash;</td>'
-                        for c in row)
+        cells = "".join(
+            "<td>" + e(c).replace("\n", "<br>") + "</td>" if c
+            else '<td class="empty">&mdash;</td>' for c in row)
         body.append(f"<tr>{cells}</tr>")
     if not body:
         body.append(f'<tr><td class="empty" colspan="{len(report.headers)}">'
@@ -2732,6 +2807,10 @@ TABLE_COLUMNS = ("Input document", "Role", "Term", "Process", "Output document")
 COL_IN, COL_ROLE, COL_TERM, COL_PROC, COL_OUT = range(5)
 TEXT_FIELDS = {COL_ROLE: "role", COL_TERM: "term", COL_PROC: "process"}
 DEFAULT_PANEL_HEIGHT = 240
+COL_WIDTHS = {COL_IN: 140, COL_ROLE: 120, COL_TERM: 100, COL_PROC: 320, COL_OUT: 140}
+ROW_HEIGHT = 28
+CELL_HPAD = 14                        # text width lost to the cell's margins
+CELL_VPAD = 8                         # text height lost to the cell's margins
 C_STALE = QColor("#b3261e")           # a role that is not in the dictionary
 
 
@@ -2762,6 +2841,59 @@ class ProcessTable(QTableWidget):
             e.accept()
             return
         super().keyPressEvent(e)
+
+
+class CellTextEdit(QPlainTextEdit):
+    """Multi-line cell editor: Enter starts a new line, Ctrl+Enter accepts."""
+
+    acceptRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabChangesFocus(True)         # Tab leaves the cell (and commits it)
+
+    def event(self, e):
+        # Delete / Backspace / F2 / Ctrl+A belong to the text, not to the
+        # window's shortcuts (delete or rename the selected diagram item)
+        if e.type() == QEvent.Type.ShortcutOverride:
+            key = e.key()
+            ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if (key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace, Qt.Key.Key_F2)
+                    or (ctrl and key == Qt.Key.Key_A)):
+                e.accept()
+                return True
+        return super().event(e)
+
+    def keyPressEvent(self, e):
+        if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            e.accept()
+            self.acceptRequested.emit()
+            return
+        super().keyPressEvent(e)
+
+
+class MultiLineDelegate(QStyledItemDelegate):
+    """Editor of the Process cell: several lines of text."""
+
+    def createEditor(self, parent, option, index):
+        ed = CellTextEdit(parent)
+        ed.acceptRequested.connect(lambda: self._finish(ed))
+        return ed
+
+    def _finish(self, ed) -> None:
+        self.commitData.emit(ed)
+        self.closeEditor.emit(ed, QAbstractItemDelegate.EndEditHint.NoHint)
+
+    def setEditorData(self, editor, index) -> None:
+        editor.setPlainText(index.data(Qt.ItemDataRole.EditRole) or "")
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index) -> None:
+        model.setData(index, multiline(editor.toPlainText()), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index) -> None:
+        editor.setGeometry(option.rect)
 
 
 class DocDelegate(QStyledItemDelegate):
@@ -2873,13 +3005,22 @@ class ProcessTablePanel(QWidget):
         t.setHorizontalHeaderLabels(list(TABLE_COLUMNS))
         t.verticalHeader().setVisible(False)
         t.verticalHeader().setDefaultSectionSize(28)
-        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh = t.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)   # drag the borders
+        hh.setStretchLastSection(True)
+        hh.setMinimumSectionSize(50)
+        for col, w in COL_WIDTHS.items():
+            t.setColumnWidth(col, w)
+        hh.sectionResized.connect(self._on_section_resized)
+        t.setWordWrap(True)
         t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._delegates = [DocDelegate(self, "in", t), DocDelegate(self, "out", t)]
         t.setItemDelegateForColumn(COL_IN, self._delegates[0])
         t.setItemDelegateForColumn(COL_OUT, self._delegates[1])
         self._role_delegate = RoleDelegate(self, t)
         t.setItemDelegateForColumn(COL_ROLE, self._role_delegate)
+        self._text_delegate = MultiLineDelegate(t)
+        t.setItemDelegateForColumn(COL_PROC, self._text_delegate)
         t.itemChanged.connect(self._on_item_changed)
         t.currentCellChanged.connect(lambda *_: self._update_buttons())
         t.clearRequested.connect(self.clear_current_cell)
@@ -2913,6 +3054,27 @@ class ProcessTablePanel(QWidget):
         item.setForeground(QBrush(C_TEXT))
         item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return item
+
+    def _on_section_resized(self, col: int, _old: int, _new: int) -> None:
+        if col == COL_PROC and not self._building:
+            self.fit_rows()
+
+    def _text_height(self, text: str) -> int:
+        width = max(20, self.table.columnWidth(COL_PROC) - CELL_HPAD)
+        flags = int(Qt.TextFlag.TextWordWrap.value | Qt.TextFlag.TextWrapAnywhere.value)
+        return self.table.fontMetrics().boundingRect(0, 0, width, 100000, flags, text).height() + CELL_VPAD
+
+    def fit_rows(self) -> None:
+        """Make the rows of every set tall enough for its multi-line Process text."""
+        p = self.process
+        if p is None or not self._row_map:
+            return
+        sets = p.table
+        heights = fit_row_heights([len(st.rows) for st in sets],
+                                  [self._text_height(st.process) for st in sets], ROW_HEIGHT)
+        for r, h in enumerate(heights[:self.table.rowCount()]):
+            if self.table.rowHeight(r) != h:
+                self.table.setRowHeight(r, h)
 
     @staticmethod
     def _doc_text(doc, labels: dict) -> str:
@@ -3019,6 +3181,8 @@ class ProcessTablePanel(QWidget):
                               self._cell(self._doc_text(row.out, lab_out), brush))
                 for col, field in TEXT_FIELDS.items():
                     cell = self._cell(getattr(st, field), brush)
+                    if col == COL_PROC:
+                        cell.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
                     if col == COL_ROLE and st.role and not self.scene.roles.has(st.role):
                         cell.setForeground(QBrush(C_STALE))
                         cell.setToolTip("This role is not in the Roles dictionary.")
@@ -3028,6 +3192,7 @@ class ProcessTablePanel(QWidget):
                 r0 += n
         finally:
             self._building = False
+        self.fit_rows()
         if select is not None:
             si, rj, col = select
             if (si, rj) in self._row_map:
@@ -3041,7 +3206,9 @@ class ProcessTablePanel(QWidget):
             self.hint.setText("No documents are linked to this process yet - connect "
                               "documents to it on the diagram, then pick them here.")
         else:
-            self.hint.setText("Double-click a cell to edit it. Add row gives the "
+            self.hint.setText("Double-click a cell to edit it; in the Process cell Enter "
+                              "starts a new line and Ctrl+Enter accepts. Drag a column "
+                              "border in the header to resize it. Add row gives the "
                               "selected set another row for one more document; "
                               "Delete empties the current cell. Roles come from "
                               "the Roles dictionary (Roles\u2026 button).")
@@ -3064,6 +3231,8 @@ class ProcessTablePanel(QWidget):
         if getattr(st, field) != item.text():
             setattr(st, field, item.text())
             self.scene.set_dirty(True)
+            if col == COL_PROC:
+                self.fit_rows()
 
     def set_role(self, row: int, name: str) -> None:
         """Called by the Role drop-down delegate."""
@@ -3881,6 +4050,7 @@ class MainWindow(QMainWindow):
         self.files_panel = DocumentFilesPanel(self.scene)
         self.files_panel.hide()                   # only shown while a document is selected
         self._panel_height = DEFAULT_PANEL_HEIGHT
+        self._reveal_token = 0            # identifies the latest pending "scroll into view"
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.view)
         self.splitter.addWidget(self.panel)       # both panels sit under the diagram;
@@ -4027,6 +4197,7 @@ class MainWindow(QMainWindow):
             items = self.scene.selectedItems()
         except RuntimeError:
             return
+        self._reveal_token += 1           # a scroll planned for an earlier selection is void
         sel = items[0] if len(items) == 1 else None
         proc = sel if isinstance(sel, ProcessItem) else None
         docu = sel if isinstance(sel, DocumentItem) else None
@@ -4046,7 +4217,8 @@ class MainWindow(QMainWindow):
             self.splitter.setSizes([max(total - h, 120)]
                                    + [h if w is shown else 0
                                       for w in (self.panel, self.files_panel)])
-        QTimer.singleShot(0, lambda: self._reveal(sel))
+        token = self._reveal_token
+        QTimer.singleShot(0, lambda: self._reveal(sel, token))
 
     def show_roles(self) -> None:
         """Open (or bring to the front) the separate Roles dictionary window."""
@@ -4056,10 +4228,23 @@ class MainWindow(QMainWindow):
         self.roles_window.raise_()
         self.roles_window.activateWindow()
 
-    def _reveal(self, item) -> None:
-        """Scroll so that the selected item is not hidden behind the panel."""
+    def _reveal(self, item, token: int) -> None:
+        """Slide the whole view so that the selected item is not hidden behind
+        the panel.
+
+        Never while a mouse button is down: the click that selected the item is
+        usually still held, and Qt re-sends the last mouse position to the scene
+        after every scroll - the pressed item would be dragged along by the
+        scroll distance and end up displaced against the other primitives.
+        So wait for the release (the scroll then moves everything together)."""
+        if token != self._reveal_token:   # the selection changed in the meantime
+            return
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            QTimer.singleShot(40, lambda: self._reveal(item, token))
+            return
         try:
-            self.view.ensureVisible(item)
+            if item.isSelected():
+                self.view.ensureVisible(item)
         except RuntimeError:              # the item was deleted meanwhile
             pass
 
@@ -4242,10 +4427,35 @@ class MainWindow(QMainWindow):
             event.ignore()
 
 
+def app_icon() -> QIcon:
+    """The application icon, decoded from APP_ICON_PNG (empty if that fails)."""
+    pm = QPixmap()
+    if not pm.loadFromData(base64.b64decode("".join(APP_ICON_PNG)), "PNG"):
+        return QIcon()
+    return QIcon(pm)
+
+
+def _set_windows_app_id() -> None:
+    """On Windows the taskbar groups a script under python.exe and shows ITS
+    icon; an explicit application id makes it show ours."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "ProcessDiagramEditor.App")
+    except Exception:                     # purely cosmetic - never stop the program
+        pass
+
+
 def main() -> int:
+    _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    icon = app_icon()
+    app.setWindowIcon(icon)               # every window and dialog inherits it
     win = MainWindow()
+    win.setWindowIcon(icon)
     win.show()
     return app.exec()
 
