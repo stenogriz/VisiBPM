@@ -5,21 +5,24 @@ Business process modelling tool with simplified notation.
 </p>
 
 ## About
-Give businesses a simple tool to describe their processes in simple notation without the complexity of the BPMN.
-Only 3 primitives to arrange:
+This tool gives businesses a simple way to describe their processes without the complexity of BPMN. The notation has only three primitives:
 - Process
 - Document
-- Outer process link
+- External process link
 
-And only one major rule (enforced in the diagram): **Processes interact only via documents.**
+It enforces one core rule in the diagram: **processes interact only through documents.**
 
-Which, in terms of business logic, means only one thing: you need information to flow between processes. If you ask, “What about physical objects, like goods, items, shipments, etc.?” the answer is simple — you always have an accompanying document for each physical object (an invoice, order, or other form). 
+In business terms, this means information must flow between processes. Physical objects such as goods, items, and shipments are covered by the same rule, because each one is always accompanied by a document (an invoice, an order, or another form) that carries its information.
 
-Each process is relatevely easy to describe. Just answer (mainly to yourself) - *who* interacts with the input information, *when* the results should be available and *what* is an essence of the action that results in some output information.
+Process description takes three answers:
+- **Who** works with the input information?
+- **When** do the results need to be available?
+- **What** is the essential action that produces the output?
 
+<br />
 <p align="center">
 <img width="870" height="417" alt="screenshot" src="https://github.com/user-attachments/assets/51ae358e-f3a0-4e8a-bb78-bc036e81ab2b" />
 </p>
 
 ## Technical
-Program is just one python script which requires only PySide6 to run. If you need a binary for the unprepared environment, just use the pyinstaller.
+The application is a single Python script with one dependency, PySide6. To distribute it as a standalone binary for environments without Python, build it with PyInstaller.
