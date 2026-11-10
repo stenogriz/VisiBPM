@@ -2806,11 +2806,47 @@ TABLE_COLUMNS = ("Input document", "Role", "Term", "Process", "Output document")
 COL_IN, COL_ROLE, COL_TERM, COL_PROC, COL_OUT = range(5)
 TEXT_FIELDS = {COL_ROLE: "role", COL_TERM: "term", COL_PROC: "process"}
 DEFAULT_PANEL_HEIGHT = 240
-COL_WIDTHS = {COL_IN: 140, COL_ROLE: 120, COL_TERM: 100, COL_PROC: 320, COL_OUT: 140}
+MIN_COL_WIDTH = 80
 ROW_HEIGHT = 28
 CELL_HPAD = 14                        # text width lost to the cell's margins
 CELL_VPAD = 8                         # text height lost to the cell's margins
 C_STALE = QColor("#b3261e")           # a role that is not in the dictionary
+
+
+def shrinkable(label, wrap: bool = False):
+    """A QLabel normally refuses to be narrower than its text, so a long hint
+    would force the whole window to grow when its panel appears. This one can
+    always be squeezed (wrap=True: its text wraps onto more lines instead)."""
+    label.setMinimumWidth(1)
+    if wrap:
+        label.setWordWrap(True)
+    return label
+
+
+class FitHeader(QHeaderView):
+    """Header that knows when a column is being changed by the user (dragging
+    a border, double-click on it to fit) as opposed to by the program."""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.by_user = False
+
+    def mousePressEvent(self, e):
+        self.by_user = True
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        try:
+            super().mouseReleaseEvent(e)
+        finally:
+            self.by_user = False
+
+    def mouseDoubleClickEvent(self, e):
+        self.by_user = True
+        try:
+            super().mouseDoubleClickEvent(e)
+        finally:
+            self.by_user = False
 
 
 class ProcessTable(QTableWidget):
@@ -2819,6 +2855,11 @@ class ProcessTable(QTableWidget):
     item while the user is working in the table."""
 
     clearRequested = Signal()
+    resized = Signal()                    # the table itself got another size
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.resized.emit()
 
     def editing(self) -> bool:
         return self.state() == QAbstractItemView.State.EditingState
@@ -2984,9 +3025,9 @@ class ProcessTablePanel(QWidget):
         self._timer.setInterval(0)
         self._timer.timeout.connect(self.refresh)
 
-        self.title = QLabel()
+        self.title = shrinkable(QLabel())
         self.title.setStyleSheet("font-weight: bold;")
-        self.hint = QLabel()
+        self.hint = shrinkable(QLabel(), wrap=True)
         self.hint.setStyleSheet("color: #6b7380;")
         self.b_set = self._button(
             "Add set", "Start a new Role / Term / Process set", self.add_set)
@@ -3004,13 +3045,18 @@ class ProcessTablePanel(QWidget):
         t.setHorizontalHeaderLabels(list(TABLE_COLUMNS))
         t.verticalHeader().setVisible(False)
         t.verticalHeader().setDefaultSectionSize(28)
-        hh = t.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)   # drag the borders
-        hh.setStretchLastSection(True)
-        hh.setMinimumSectionSize(50)
-        for col, w in COL_WIDTHS.items():
-            t.setColumnWidth(col, w)
+        hh = FitHeader(Qt.Orientation.Horizontal, t)
+        t.setHorizontalHeader(hh)
+        hh.setMinimumSectionSize(MIN_COL_WIDTH)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)   # every border can be dragged
+        self._fitting = False             # the program (not the user) is setting widths
+        self._custom = False              # the user has set a width: stop fitting automatically
         hh.sectionResized.connect(self._on_section_resized)
+        t.resized.connect(self.autofit)
+        # a vertical scroll bar appearing/disappearing changes the width left for Process
+        t.verticalScrollBar().rangeChanged.connect(
+            lambda *_: QTimer.singleShot(0, self.autofit))
         t.setWordWrap(True)
         t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._delegates = [DocDelegate(self, "in", t), DocDelegate(self, "out", t)]
@@ -3054,7 +3100,28 @@ class ProcessTablePanel(QWidget):
         item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return item
 
+    def autofit(self) -> None:
+        """The default widths: Input document, Role, Term and Output document
+        as wide as their content, Process takes all the room left. Used until
+        the user drags a column border; after that the widths are theirs."""
+        if self._custom:
+            return
+        t = self.table
+        hh = t.horizontalHeader()
+        self._fitting = True
+        try:
+            used = 0
+            for col in (COL_IN, COL_ROLE, COL_TERM, COL_OUT):
+                w = max(MIN_COL_WIDTH, t.sizeHintForColumn(col), hh.sectionSizeHint(col))
+                t.setColumnWidth(col, w)
+                used += w
+            t.setColumnWidth(COL_PROC, max(MIN_COL_WIDTH, t.viewport().width() - used))
+        finally:
+            self._fitting = False
+
     def _on_section_resized(self, col: int, _old: int, _new: int) -> None:
+        if not self._fitting and self.table.horizontalHeader().by_user:
+            self._custom = True
         if col == COL_PROC and not self._building:
             self.fit_rows()
 
@@ -3191,6 +3258,7 @@ class ProcessTablePanel(QWidget):
                 r0 += n
         finally:
             self._building = False
+        self.autofit()
         self.fit_rows()
         if select is not None:
             si, rj, col = select
@@ -3206,8 +3274,7 @@ class ProcessTablePanel(QWidget):
                               "documents to it on the diagram, then pick them here.")
         else:
             self.hint.setText("Double-click a cell to edit it; in the Process cell Enter "
-                              "starts a new line and Ctrl+Enter accepts. Drag a column "
-                              "border in the header to resize it. Add row gives the "
+                              "starts a new line and Ctrl+Enter accepts. Add row gives the "
                               "selected set another row for one more document; "
                               "Delete empties the current cell. Roles come from "
                               "the Roles dictionary (Roles\u2026 button).")
@@ -3750,11 +3817,11 @@ class DocumentFilesPanel(QWidget):
         self.document: DocumentItem | None = None
         self._entries: list[tuple[str, int]] = []      # list row -> ("file" | "link", index)
 
-        self.title = QLabel()
+        self.title = shrinkable(QLabel())
         self.title.setStyleSheet("font-weight: bold;")
-        self.hint = QLabel("Add files attaches copies of files, Add link a web address "
+        self.hint = shrinkable(QLabel("Add files attaches copies of files, Add link a web address "
                            "(double-click a link to open it). Everything is stored inside "
-                           "the .bpx file when the diagram is saved.")
+                           "the .bpx file when the diagram is saved."), wrap=True)
         self.hint.setStyleSheet("color: #6b7380;")
         self.b_add = self._button(
             "Add files...", "Attach files to the document", self.add_files)
@@ -4210,7 +4277,9 @@ class MainWindow(QMainWindow):
         if shown is None:
             return
         if not shown.isVisible():
+            before = self.size()
             shown.show()
+            self._keep_size(before)
             total = self.splitter.height() or sum(self.splitter.sizes()) or 600
             h = min(self._panel_height, max(140, total // 2))
             self.splitter.setSizes([max(total - h, 120)]
@@ -4218,6 +4287,17 @@ class MainWindow(QMainWindow):
                                       for w in (self.panel, self.files_panel)])
         token = self._reveal_token
         QTimer.singleShot(0, lambda: self._reveal(sel, token))
+
+    def _keep_size(self, size) -> None:
+        """Showing a panel must never resize the window: if the layout still
+        changed it (a panel asking for more room than the window has), undo that
+        once the layout has settled."""
+        def restore():
+            if (not self.isMaximized() and not self.isFullScreen()
+                    and self.size() != size):
+                self.resize(size)
+        QTimer.singleShot(0, restore)
+        QTimer.singleShot(50, restore)
 
     def show_roles(self) -> None:
         """Open (or bring to the front) the separate Roles dictionary window."""
