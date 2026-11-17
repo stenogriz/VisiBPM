@@ -81,12 +81,15 @@ Usage
     under the diagram: a Description and the URL). They are listed with the
     files, opened with a double-click, and stored in the .bpx file too. A
     document with at least one file or link shows the paper clip.
-  * File > Reports exports two reports, as an HTML page or a CSV table:
+  * File > Reports exports three reports, as an HTML page or a CSV table:
       Roles      every role with its description, assigned roles and users
       Documents  every document that connects processes: its author role (and
                  that role's users), the process it comes from, the term given
                  and the documents it is based on - all read from the process
                  tables - plus the processes it is passed to.
+      Role actions  asks for one role (its description is shown), then lists
+                 every set of every process table assigned to that role: the
+                 process, input documents, term, process text, output documents.
 
 Requirements:  pip install PySide6
 """
@@ -233,7 +236,8 @@ GRID = 10
 MIN_W, MIN_H = 60, 40
 HANDLE = 9            # visual size of a resize handle (px)
 HANDLE_HIT = 13       # clickable size of a resize handle (px)
-EAR = 18              # size of the dog-ear on documents
+EAR = 18              # room the dog-ear keeps free on documents (ports stay off it)
+EAR_DRAWN = 0.5       # the fold actually drawn is this fraction of that room
 
 PROCESS, DOCUMENT, EXTERNAL, COMMENT = "process", "document", "external", "comment"
 MODE_SELECT, MODE_PROCESS, MODE_DOCUMENT, MODE_CONNECT = (
@@ -275,7 +279,9 @@ PORT_SNAP = GRID / 2.0         # attachment points sit on multiples of this (hal
 PORT_GAP = 2 * PORT_SNAP       # minimum distance between two attachment points
 PORT_MARGIN = 2.0     # attachment points keep this distance from the corners
 LANE_GAP = 10.0       # preferred distance between parallel, overlapping segments
-ARROW_LEN = 11.0      # length of the arrow head
+ARROW_LEN = 11.0      # room the routing keeps free in front of the target for the head
+ARROW_HEAD_LEN = 7.0  # the drawn head: length ...
+ARROW_HEAD_HALF = 3.2 # ... and half of its width (filled, no outline)
 BIG = 1e9
 END_KEYS = ("src", "dst")        # handles that slide along a border
 
@@ -1201,6 +1207,49 @@ def documents_report(nodes, roles: RoleDictionary) -> Report:
         "describe the document yet.")
 
 
+ROLE_ACTIONS_HEADERS = ("Process", "Input document", "Term", "Process", "Output document")
+
+
+def role_actions_report(nodes, roles: RoleDictionary, role_name: str) -> Report:
+    """What one role does: every set of every process table that is assigned
+    to `role_name` (directly - not through roles that include it).
+
+    One row per set: the process on the diagram, the set's input documents,
+    its term, its process text and its output documents (several documents
+    of one set are listed one per line)."""
+    procs = [n for n in nodes if n.KIND == PROCESS]
+    docs = [n for n in nodes if n.KIND == DOCUMENT]
+    p_label = dict(zip(map(id, procs), unique_labels(procs)))
+    d_label = dict(zip(map(id, docs), unique_labels(docs)))
+
+    def doc_list(found) -> str:
+        names: list = []
+        for d in found:
+            if d is not None:
+                name = d_label.get(id(d)) or plain_name(d)
+                if name not in names:
+                    names.append(name)
+        return "\n".join(names)
+
+    rows = []
+    for p in sorted(procs, key=lambda n: (p_label[id(n)].casefold(), p_label[id(n)])):
+        for st in p.table:
+            if _one_line(st.role) != role_name:
+                continue
+            rows.append((p_label[id(p)],
+                         doc_list(r.inp for r in st.rows),
+                         _one_line(st.term),
+                         multiline(st.process),
+                         doc_list(r.out for r in st.rows)))
+    role = roles.find(role_name)
+    description = _one_line(role.description) if role is not None else ""
+    note = f"Role “{role_name}”" + (f": {description}" if description else "") + ". "
+    return Report(
+        f"Role actions: {role_name}", ROLE_ACTIONS_HEADERS, rows,
+        note + "Lists the sets of the process tables that are assigned to this role "
+        "directly; sets of roles that include it are not listed.")
+
+
 def csv_safe(value: str) -> str:
     """Keep spreadsheet programs from running a cell that starts like a formula."""
     return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
@@ -1969,7 +2018,7 @@ class DocumentItem(NodeItem):
         return min(EAR, self._rect.width() / 3, self._rect.height() / 3)
 
     def draw_body(self, painter: QPainter) -> None:
-        draw_document_shape(painter, self._rect, self.ear())
+        draw_document_shape(painter, self._rect, self.ear() * EAR_DRAWN)
 
     def usable_span(self, side: str) -> tuple[float, float]:
         # The dog-ear cuts away the first `ear` px of the left and top sides.
@@ -2220,19 +2269,25 @@ class ConnectionItem(QGraphicsPathItem):
         line, arrow = QPainterPath(), QPolygonF()
         if len(pts) >= 2:
             line.moveTo(pts[0])
-            for p in pts[1:]:
+            for p in pts[1:-1]:
                 line.lineTo(p)
             tip, prev = pts[-1], pts[-2]
             length = math.hypot(tip.x() - prev.x(), tip.y() - prev.y())
             if length > 0:
                 ux, uy = (tip.x() - prev.x()) / length, (tip.y() - prev.y()) / length
-                half = 5.0
-                base = QPointF(tip.x() - ux * ARROW_LEN, tip.y() - uy * ARROW_LEN)
+                half = ARROW_HEAD_HALF
+                base = QPointF(tip.x() - ux * ARROW_HEAD_LEN, tip.y() - uy * ARROW_HEAD_LEN)
                 arrow = QPolygonF([
                     tip,
                     QPointF(base.x() - uy * half, base.y() + ux * half),
                     QPointF(base.x() + uy * half, base.y() - ux * half),
                 ])
+                # The line stops 1 px inside the head: running on to the tip,
+                # it would stick out of the narrow tip and past the border.
+                cut = min(ARROW_HEAD_LEN - 1.0, length)
+                line.lineTo(QPointF(tip.x() - ux * cut, tip.y() - uy * cut))
+            else:
+                line.lineTo(tip)
         self._line = line
         self._arrow = arrow
         combined = QPainterPath(line)
@@ -2291,9 +2346,9 @@ class ConnectionItem(QGraphicsPathItem):
                 painter.setPen(hpen)
                 painter.setBrush(Qt.GlobalColor.white)
                 painter.drawEllipse(p, HANDLE / 2 + 1, HANDLE / 2 + 1)
-        painter.setPen(pen)
-        painter.setBrush(color)
-        painter.drawPolygon(self._arrow)
+        painter.setPen(Qt.PenStyle.NoPen)              # filled only: an outline would
+        painter.setBrush(color)                        # enlarge the head and push its
+        painter.drawPolygon(self._arrow)               # tip past the border
         for key, p in handles:                        # square: segments
             if key not in END_KEYS:
                 painter.setPen(hpen)
@@ -3600,6 +3655,85 @@ ROLE_COLUMNS = ("Role", "Description", "Actual set")
 RCOL_NAME, RCOL_DESC, RCOL_SET = range(3)
 
 
+class RoleActionsDialog(QDialog):
+    """File > Reports > Role actions: choose the role to report on (its
+    description is shown under the list), then Generate or Cancel.
+
+    `build(role_name)` makes the report. When it has no rows the window says so
+    and stays open, so another role can be picked; otherwise the finished
+    report is in self.report after exec() returns Accepted."""
+
+    def __init__(self, roles: RoleDictionary, build, current: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Role actions")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self._roles = roles
+        self._build = build
+        self.report: Report | None = None
+
+        self.combo = QComboBox()
+        self.combo.setMaxVisibleItems(20)
+        self.combo.addItems(roles.names())
+        if current in roles.names():
+            self.combo.setCurrentText(current)        # the role of the last report
+
+        self.description = QLabel()
+        self.description.setTextFormat(Qt.TextFormat.PlainText)
+        self.description.setWordWrap(True)
+        self.description.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.description.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.description.setMinimumHeight(self.fontMetrics().lineSpacing() * 4 + 14)
+        self.combo.currentTextChanged.connect(self._show_description)
+
+        buttons = QDialogButtonBox()
+        self.b_generate = buttons.addButton("Generate", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self.b_generate.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Role:"))
+        lay.addWidget(self.combo)
+        lay.addSpacing(4)
+        lay.addWidget(QLabel("Description:"))
+        lay.addWidget(self.description, 1)
+        lay.addSpacing(6)
+        lay.addWidget(buttons)
+        self._show_description(self.combo.currentText())
+
+    def _show_description(self, name: str) -> None:
+        role = self._roles.find(name)
+        text = role.description.strip() if role is not None else ""
+        box = "border: 1px solid #cfd5de; border-radius: 3px; padding: 6px;"
+        if text:
+            self.description.setText(text)
+            self.description.setStyleSheet(f"QLabel {{ {box} background: #f8fafc; }}")
+        else:
+            self.description.setText("(no description)")
+            self.description.setStyleSheet(
+                f"QLabel {{ {box} background: #f8fafc; color: #8a919c; font-style: italic; }}")
+
+    def role_name(self) -> str:
+        return self.combo.currentText()
+
+    def accept(self) -> None:
+        name = self.role_name()
+        if not name:
+            return
+        report = self._build(name)
+        if not report.rows:
+            QMessageBox.information(
+                self, "Role actions", f"No process table has a set assigned to the role "
+                f"“{name}” - there is nothing to report.\nChoose another role, or assign "
+                "the role to a set in the table under the diagram.")
+            self.combo.setFocus()
+            return
+        self.report = report
+        super().accept()
+
+
 class MembersDialog(QDialog):
     """Edit the actual set of one role: tick the roles it includes and the
     users that belong to it. Every user already known to the dictionary is
@@ -4332,6 +4466,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.splitter)
         self.file_path: Path | None = None
         self.roles_window: RolesWindow | None = None   # created on first use
+        self._last_action_role = ""          # preselected in the next Role actions report
 
         self.hint_label = QLabel()
         self.statusBar().addPermanentWidget(self.hint_label)
@@ -4378,6 +4513,8 @@ class MainWindow(QMainWindow):
         self.a_svg = S("Export as S&VG\u2026", self.export_svg)
         self.a_report_roles = S("&Roles\u2026", lambda: self.export_report("roles"))
         self.a_report_docs = S("&Documents\u2026", lambda: self.export_report("documents"))
+        self.a_report_actions = S("Role &actions\u2026",
+                                  lambda: self.export_report("role-actions"))
         self.a_quit = S("&Quit", self.close, QKeySequence.StandardKey.Quit)
 
         self.a_edit = S("&Rename", self.scene.edit_selected_label, "F2")
@@ -4426,6 +4563,7 @@ class MainWindow(QMainWindow):
         reports = m.addMenu("&Reports")
         reports.addAction(self.a_report_roles)
         reports.addAction(self.a_report_docs)
+        reports.addAction(self.a_report_actions)
         m.addSeparator()
         m.addAction(self.a_quit)
 
@@ -4668,13 +4806,24 @@ class MainWindow(QMainWindow):
 
     def export_report(self, kind: str) -> None:
         """File > Reports: build the report, ask where to save it, write it."""
+        suffix = kind
+        if kind in ("roles", "role-actions") and not len(self.scene.roles):
+            QMessageBox.information(
+                self, APP_NAME, "The Roles dictionary is empty - there is nothing to "
+                "report yet.\nAdd roles with Edit > Roles dictionary.")
+            return
         if kind == "roles":
-            if not len(self.scene.roles):
-                QMessageBox.information(
-                    self, APP_NAME, "The Roles dictionary is empty - there is nothing to "
-                    "report yet.\nAdd roles with Edit > Roles dictionary.")
-                return
             report = roles_report(self.scene.roles)
+        elif kind == "role-actions":
+            nodes, roles = self.scene.nodes(), self.scene.roles
+            dlg = RoleActionsDialog(roles, lambda name: role_actions_report(nodes, roles, name),
+                                    self._last_action_role, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted or dlg.report is None:
+                return                       # Cancel
+            role = self._last_action_role = dlg.role_name()
+            report = dlg.report
+            safe = "".join(ch if ch.isalnum() or ch in " -_." else "_" for ch in role).strip(" .")
+            suffix = f"{kind}-{safe}" if safe else kind
         else:
             report = documents_report(self.scene.nodes(), self.scene.roles)
             if not report.rows:
@@ -4683,7 +4832,7 @@ class MainWindow(QMainWindow):
                     "nothing to report.")
                 return
         stem = self.file_path.stem if self.file_path else "diagram"
-        start = f"{stem}-{kind}.html"
+        start = f"{stem}-{suffix}.html"
         if self.file_path:
             start = str(self.file_path.with_name(start))
         name, chosen = QFileDialog.getSaveFileName(
