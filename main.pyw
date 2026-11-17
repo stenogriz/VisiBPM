@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import bisect
 import csv
 import html
 import io
@@ -108,6 +109,7 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -227,7 +229,7 @@ OPEN_FILTER = FILE_FILTER
 # --------------------------------------------------------------------------- #
 # Constants / look & feel
 # --------------------------------------------------------------------------- #
-GRID = 20
+GRID = 10
 MIN_W, MIN_H = 60, 40
 HANDLE = 9            # visual size of a resize handle (px)
 HANDLE_HIT = 13       # clickable size of a resize handle (px)
@@ -255,6 +257,7 @@ C_EXTERNAL_FILL = QColor("#c3c8d0")
 C_DOC_FILL = QColor("#fff4c9")
 C_DOC_FOLD = QColor("#e4cf84")
 C_ARROW = QColor("#3b4658")
+GRID_PEN = QPen(QColor("#f2f4f7"), 0)     # cosmetic 1 px pen of the background grid
 
 HANDLE_CURSORS = {
     "tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
@@ -320,8 +323,103 @@ def _port_levels(node, border: str) -> list[float]:
     return [k * PORT_SNAP for k in range(k0, k1 + 1)] or [(lo + hi) / 2]
 
 
+class SegIndex:
+    """The segments already placed, kept sorted by their coordinate (one list
+    per orientation). A clearance query then only looks at the few segments
+    whose coordinate is near the one asked about, instead of at all of them -
+    routing is dominated by these queries."""
+
+    __slots__ = ("_keys", "_segs")
+
+    def __init__(self, segs=()):
+        self._keys = {"h": [], "v": []}
+        self._segs = {"h": [], "v": []}
+        by_orient = {"h": [], "v": []}
+        for s in segs:
+            by_orient.setdefault(s[0], []).append(s)
+        for o, lst in by_orient.items():
+            lst.sort(key=lambda s: s[1])
+            self._segs[o] = lst
+            self._keys[o] = [s[1] for s in lst]
+
+    def add(self, seg) -> None:
+        keys = self._keys.setdefault(seg[0], [])
+        i = bisect.bisect_right(keys, seg[1])
+        keys.insert(i, seg[1])
+        self._segs.setdefault(seg[0], []).insert(i, seg)
+
+    def extend(self, segs) -> None:
+        for s in segs:
+            self.add(s)
+
+    def remove(self, seg) -> None:
+        """Remove this very segment (the same tuple object that was added)."""
+        keys, lst = self._keys[seg[0]], self._segs[seg[0]]
+        i = bisect.bisect_left(keys, seg[1])
+        while i < len(keys) and keys[i] == seg[1]:
+            if lst[i] is seg:
+                del keys[i], lst[i]
+                return
+            i += 1
+        raise ValueError("segment not in the index")
+
+    def near(self, orient, coord, lo, hi, gap) -> bool:
+        """Is a placed parallel segment overlapping [lo, hi] closer than `gap`?
+        (Same answer as _clearance(...) < gap, without scanning everything.)"""
+        if lo > hi:
+            lo, hi = hi, lo
+        keys = self._keys.get(orient)
+        if not keys:
+            return False
+        segs = self._segs[orient]
+        # the window is a little wider than `gap`; the exact test is below
+        i = bisect.bisect_left(keys, coord - gap - 1.0)
+        end = coord + gap + 1.0
+        n = len(keys)
+        while i < n and keys[i] <= end:
+            _o, c, l, h, _key = segs[i]
+            if abs(c - coord) < gap and min(h, hi) - max(l, lo) >= -1.0:
+                return True
+            i += 1
+        return False
+
+    def clearance(self, orient, coord, lo, hi) -> float:
+        """Distance to the nearest placed parallel segment that overlaps
+        [lo, hi] (BIG if there is none): walks outwards from `coord` and stops
+        as soon as nothing closer can follow."""
+        if lo > hi:
+            lo, hi = hi, lo
+        keys = self._keys.get(orient)
+        if not keys:
+            return BIG
+        segs = self._segs[orient]
+        best = BIG
+        i = bisect.bisect_left(keys, coord)
+        for j in range(i, len(keys)):              # coordinates >= coord
+            d = keys[j] - coord
+            if d >= best:
+                break
+            _o, _c, l, h, _key = segs[j]
+            if min(h, hi) - max(l, lo) >= -1.0:
+                best = d
+        for j in range(i - 1, -1, -1):             # coordinates < coord
+            d = coord - keys[j]
+            if d >= best:
+                break
+            _o, _c, l, h, _key = segs[j]
+            if min(h, hi) - max(l, lo) >= -1.0:
+                best = d
+        return best
+
+
+def _as_index(placed) -> SegIndex:
+    return placed if isinstance(placed, SegIndex) else SegIndex(placed)
+
+
 def _clearance(orient, coord, lo, hi, placed) -> float:
     """Distance to the nearest placed parallel segment that overlaps [lo, hi]."""
+    if isinstance(placed, SegIndex):
+        return placed.clearance(orient, coord, lo, hi)
     if lo > hi:
         lo, hi = hi, lo
     d = BIG
@@ -332,6 +430,8 @@ def _clearance(orient, coord, lo, hi, placed) -> float:
 
 
 def _seg_conflict(orient, coord, lo, hi, placed, gap=LANE_GAP) -> bool:
+    if isinstance(placed, SegIndex):
+        return placed.near(orient, coord, lo, hi, gap)
     return _clearance(orient, coord, lo, hi, placed) < gap
 
 
@@ -340,19 +440,19 @@ def _pick_lane(base, cand, placed, lower, upper, steps) -> float:
     the segments cand(coord) -> [(orient, coord, lo, hi), ...] comes closer than
     LANE_GAP to an overlapping parallel segment that is already placed."""
     base = min(max(base, lower), upper)
+    placed = _as_index(placed)
 
     def clearance(c):
-        return min((_clearance(o, k, lo, hi, placed) for o, k, lo, hi in cand(c)),
+        return min((placed.clearance(o, k, lo, hi) for o, k, lo, hi in cand(c)),
                    default=BIG)
 
     def acceptable(c, relaxed):
         segs = cand(c)                   # the first one is the lane itself
-        if _clearance(*segs[0], placed) < LANE_GAP:
+        if placed.near(*segs[0], LANE_GAP):
             return False
         # 2nd round: feeders only have to stay off other lines, not LANE_GAP away
         need = 1.0 if relaxed else LANE_GAP
-        return all(_clearance(o, k, lo, hi, placed) >= need
-                   for o, k, lo, hi in segs[1:])
+        return not any(placed.near(o, k, lo, hi, need) for o, k, lo, hi in segs[1:])
 
     for relaxed in (False, True):
         for k in range(80):
@@ -478,6 +578,7 @@ def build_route(c, placed) -> Route:
     "out", "mid", "in" (routes that have to turn back). Automatic lanes avoid
     the segments in `placed`; lanes with a manual offset in c.offsets are kept.
     """
+    placed = _as_index(placed)       # a plain list is accepted, too
     a, b = c.source.scene_rect(), c.target.scene_rect()
     sx, ex = a.right(), b.left()
     y1, y2 = c.y1, c.y2
@@ -583,19 +684,30 @@ def layout_connections(conns) -> None:
         c.case = case
     # hand-made routes first, so the automatic ones make room for them
     order = sorted(conns, key=lambda c: (0 if c.offsets else 1, c.seq))
-    placed = []
+    placed = SegIndex()
     for c in order:
         c.route = build_route(c, placed)
         placed.extend(c.route.segs)
     # refinement: re-place every route against ALL the others, because a
-    # route placed early cannot see the lines of the ones placed after it
+    # route placed early cannot see the lines of the ones placed after it.
+    # The index always holds every route; a route is taken out while it is
+    # being re-placed and put back afterwards.
     for _ in range(3):
-        before = [[(p.x(), p.y()) for p in c.route.pts] for c in order]
+        moved = False
         for c in order:
-            others = [s for o in order if o is not c for s in o.route.segs]
-            c.route = build_route(c, others)
-        if before == [[(p.x(), p.y()) for p in c.route.pts] for c in order]:
+            old = c.route
+            for s in old.segs:
+                placed.remove(s)
+            c.route = build_route(c, placed)
+            placed.extend(c.route.segs)
+            if not moved and _pts_key(old.pts) != _pts_key(c.route.pts):
+                moved = True
+        if not moved:
             break
+
+
+def _pts_key(pts) -> tuple:
+    return tuple((p.x(), p.y()) for p in pts)
 
 
 def move_handle(conn, key, x, y, others, snap=True) -> bool:
@@ -618,8 +730,8 @@ def move_handle(conn, key, x, y, others, snap=True) -> bool:
         y = min(_port_levels(node, "r" if out else "l"), key=lambda v: abs(v - y))
         # lines of the neighbours on the same border will move out of the way
         skip = {id(o) for o in node.connections if (o.source is node) == out}
-        placed = [s for o in others if id(o) not in skip and o.route is not None
-                  for s in o.route.segs]
+        placed = SegIndex([s for o in others if id(o) not in skip and o.route is not None
+                           for s in o.route.segs])
         old_t, old_y = (conn.src_t, conn.y1) if out else (conn.dst_t, conn.y2)
         t = 0.5 if hi <= lo else (y - lo) / (hi - lo)
         if out:
@@ -635,7 +747,7 @@ def move_handle(conn, key, x, y, others, snap=True) -> bool:
         return True
     if key not in route.bases:                # move a segment
         return False
-    placed = [s for o in others if o.route is not None for s in o.route.segs]
+    placed = SegIndex([s for o in others if o.route is not None for s in o.route.segs])
     coord = y if key == "mid" else x
     if snap:
         coord = round(coord / (GRID / 2)) * (GRID / 2)
@@ -833,6 +945,14 @@ class RoleDictionary:
                 return r
         return None
 
+    def _by_name(self) -> dict:
+        """name -> role, for walks that look up many names (first one wins,
+        like find())."""
+        table: dict = {}
+        for r in self.items:
+            table.setdefault(r.name, r)
+        return table
+
     def has(self, name) -> bool:
         return self.find(name) is not None
 
@@ -886,8 +1006,9 @@ class RoleDictionary:
         """Names of all roles that `name` includes, directly or indirectly."""
         seen: set = set()
         todo = [name]
+        by_name = self._by_name()
         while todo:
-            r = self.find(todo.pop())
+            r = by_name.get(todo.pop())
             for child in (r.roles if r else []):
                 if child not in seen:
                     seen.add(child)
@@ -937,17 +1058,20 @@ class RoleDictionary:
     def effective_users(self, name: str) -> list[str]:
         """Every user of the role, including those of the roles it includes."""
         order: list[str] = []
+        listed: set = set()                   # the users already in `order`
         seen: set = set()
+        by_name = self._by_name()
 
         def walk(n: str) -> None:             # own users first, then each included role in turn
             if n in seen:
                 return
             seen.add(n)
-            r = self.find(n)
+            r = by_name.get(n)
             if r is None:
                 return
             for u in r.users:
-                if u not in order:
+                if u not in listed:
+                    listed.add(u)
                     order.append(u)
             for child in r.roles:
                 walk(child)
@@ -1351,10 +1475,13 @@ def read_archive(path, store: AttachmentStore):
             if not isinstance(data, dict):
                 raise ValueError(f"{ARCHIVE_JSON} does not contain a diagram")
             files: dict[str, Path] = {}
+            # tar.getmember() scans the whole member list on every call; one
+            # dictionary makes the lookups cheap (the last entry of a name
+            # wins, as with getmember)
+            members = {m.name: m for m in tar.getmembers()}
             for name in referenced_members(data):
-                try:
-                    member = tar.getmember(name)
-                except KeyError:
+                member = members.get(name)
+                if member is None:
                     continue                       # reported as "missing" by load_dict
                 src = tar.extractfile(member) if member.isfile() else None
                 if src is None:                    # links, devices, folders: ignored
@@ -1616,10 +1743,13 @@ class NodeItem(QGraphicsItem):
             h = self.handle_at(event.pos())
             if h:
                 shape = HANDLE_CURSORS[h]
-        self.setCursor(QCursor(shape))
+        if shape != getattr(self, "_cursor_shape", None):    # only when it changes
+            self._cursor_shape = shape
+            self.setCursor(QCursor(shape))
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event) -> None:
+        self._cursor_shape = None
         self.unsetCursor()
         super().hoverLeaveEvent(event)
 
@@ -1709,8 +1839,19 @@ class ProcessItem(NodeItem):
         return d
 
 
+_PAPERCLIP: QPainterPath | None = None
+
+
 def paperclip_path() -> QPainterPath:
-    """A paper clip in a 10 x 17 box (y points down): three nested bends."""
+    """A paper clip in a 10 x 17 box (y points down): three nested bends.
+    Built once; every document with attachments draws the same path."""
+    global _PAPERCLIP
+    if _PAPERCLIP is None:
+        _PAPERCLIP = _build_paperclip()
+    return _PAPERCLIP
+
+
+def _build_paperclip() -> QPainterPath:
     p = QPainterPath(QPointF(9, 13))
     p.lineTo(9, 4.5)
     p.arcTo(QRectF(1, 0.5, 8, 8), 0, 180)       # big bend at the top
@@ -1720,6 +1861,31 @@ def paperclip_path() -> QPainterPath:
     p.arcTo(QRectF(3, 4.5, 4, 4), 0, 180)       # small bend inside
     p.lineTo(3, 12.5)
     return p
+
+
+def draw_document_shape(painter: QPainter, r: QRectF, e: float) -> None:
+    """A document: the rectangle `r` with its upper-left corner folded over by
+    `e`. Uses the painter's pen and brush for the body and C_DOC_FOLD for the
+    fold. (Shared by the diagram item and the toolbar icon.)"""
+    tip_top = QPointF(r.left() + e, r.top())       # where the fold meets the top border
+    tip_left = QPointF(r.left(), r.top() + e)      # ... and the left border
+    inner = QPointF(r.left() + e, r.top() + e)     # its inner, right-angled corner
+    painter.drawPolygon(QPolygonF([tip_top, r.topRight(), r.bottomRight(),
+                                   r.bottomLeft(), tip_left]))
+    pen = QPen(painter.pen())
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(C_DOC_FOLD)
+    painter.drawPolygon(QPolygonF([tip_top, inner, tip_left]))
+    # The fold is outlined with open lines, not as a closed triangle: a closed
+    # triangle gets mitred joins at its two 45-degree tips, which stick out past
+    # the top and left borders as small spikes (about 0.7 x the pen width).
+    # Flat line ends stop on the border instead, and the inner corner keeps
+    # its sharp mitre.
+    pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPolyline(QPolygonF([tip_top, inner, tip_left]))
+    painter.drawLine(QLineF(tip_left, tip_top))    # the fold's fill covered half of this border
 
 
 class DocumentItem(NodeItem):
@@ -1803,19 +1969,7 @@ class DocumentItem(NodeItem):
         return min(EAR, self._rect.width() / 3, self._rect.height() / 3)
 
     def draw_body(self, painter: QPainter) -> None:
-        r, e = self._rect, self.ear()
-        outline = QPolygonF([
-            QPointF(r.left() + e, r.top()), r.topRight(),
-            r.bottomRight(), r.bottomLeft(), QPointF(r.left(), r.top() + e),
-        ])
-        painter.drawPolygon(outline)
-        fold = QPolygonF([
-            QPointF(r.left() + e, r.top()),
-            QPointF(r.left() + e, r.top() + e),
-            QPointF(r.left(), r.top() + e),
-        ])
-        painter.setBrush(C_DOC_FOLD)
-        painter.drawPolygon(fold)
+        draw_document_shape(painter, self._rect, self.ear())
 
     def usable_span(self, side: str) -> tuple[float, float]:
         # The dog-ear cuts away the first `ear` px of the left and top sides.
@@ -1851,6 +2005,7 @@ class ExternalItem(NodeItem):
     def __init__(self, x: float, y: float, w: float = SIZE, h: float = SIZE,
                  text: str = ""):
         super().__init__(x, y, self.SIZE, self.SIZE, text)   # size is fixed
+        self._caption: QRectF | None = None    # cached caption_rect()
 
     def min_height(self) -> float:
         return float(self.SIZE)
@@ -1862,7 +2017,10 @@ class ExternalItem(NodeItem):
         return not self.connections
 
     def refresh_geometry(self) -> None:
-        self.prepareGeometryChange()   # the caption is part of the bounding rect
+        # the caption is part of the bounding rect: announce the change while
+        # the cached (old) caption is still in place, then measure it anew
+        self.prepareGeometryChange()
+        self._caption = None
         self.update()
 
     def sends(self) -> bool:
@@ -1870,14 +2028,21 @@ class ExternalItem(NodeItem):
         return bool(self.connections) and self.connections[0].source is self
 
     def caption_rect(self) -> QRectF:
-        label = " ".join(self.text.split())
-        if not label:
-            return QRectF()
-        fm = QFontMetricsF(QApplication.font())
-        w, h = fm.horizontalAdvance(label) + 2, fm.height()
-        y = (self._rect.height() - h) / 2
-        x = -CAPTION_GAP - w if self.sends() else self._rect.width() + CAPTION_GAP
-        return QRectF(x, y, w, h)
+        """Where the name is written. Measured once and cached (Qt asks for the
+        bounding rect, which includes it, on every repaint and hit test);
+        refresh_geometry() - called whenever the name or the connection
+        changes - drops the cache."""
+        if getattr(self, "_caption", None) is None:     # (also during __init__)
+            label = " ".join(self.text.split())
+            if not label:
+                self._caption = QRectF()
+            else:
+                fm = QFontMetricsF(QApplication.font())
+                w, h = fm.horizontalAdvance(label) + 2, fm.height()
+                y = (self._rect.height() - h) / 2
+                x = -CAPTION_GAP - w if self.sends() else self._rect.width() + CAPTION_GAP
+                self._caption = QRectF(x, y, w, h)
+        return QRectF(self._caption)
 
     def boundingRect(self) -> QRectF:
         r = super().boundingRect()
@@ -2018,6 +2183,10 @@ class ConnectionItem(QGraphicsPathItem):
         self.route: Route | None = None
         self._line = QPainterPath()
         self._arrow = QPolygonF()
+        self._drawn: tuple | None = None      # the points the drawn path was built from
+        self._brect: QRectF | None = None     # cached boundingRect()
+        self._shape: QPainterPath | None = None   # cached shape() ...
+        self._shape_sel = False               # ... and whether it includes the handles
         self._active: str | None = None       # handle being dragged
         self.setZValue(0)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
@@ -2039,9 +2208,16 @@ class ConnectionItem(QGraphicsPathItem):
 
     # ---- geometry ---------------------------------------------------------- #
     def apply_route(self) -> None:
-        """Rebuild the drawn path from self.route."""
-        line, arrow = QPainterPath(), QPolygonF()
+        """Rebuild the drawn path from self.route. Nothing happens if the line
+        has not moved: a relayout re-routes every connection, but usually only
+        a few of them change, and re-setting an unchanged path still costs a
+        scene-index update and a repaint."""
         pts = self.route.pts if self.route is not None else []
+        key = _pts_key(pts)
+        if key == self._drawn:
+            return
+        self._drawn = key
+        line, arrow = QPainterPath(), QPolygonF()
         if len(pts) >= 2:
             line.moveTo(pts[0])
             for p in pts[1:]:
@@ -2063,21 +2239,31 @@ class ConnectionItem(QGraphicsPathItem):
         if not arrow.isEmpty():
             combined.addPolygon(arrow)
             combined.closeSubpath()
+        self.prepareGeometryChange()          # while boundingRect() is still the old one
+        self._brect = combined.boundingRect().adjusted(-HANDLE, -HANDLE, HANDLE, HANDLE)
+        self._shape = None
         self.setPath(combined)
         self.update()
 
+    # boundingRect() and shape() are called by Qt for every repaint and every
+    # mouse move over the view (hover and hit tests), so both are cached.
     def boundingRect(self) -> QRectF:
-        return self.path().boundingRect().adjusted(-HANDLE, -HANDLE, HANDLE, HANDLE)
+        if self._brect is None:
+            self._brect = self.path().boundingRect().adjusted(-HANDLE, -HANDLE, HANDLE, HANDLE)
+        return self._brect
 
     def shape(self) -> QPainterPath:
-        stroker = QPainterPathStroker()
-        stroker.setWidth(12)
-        shape = stroker.createStroke(self.path())
-        if self.isSelected() and self.route is not None:
-            s = HANDLE_HIT
-            for _key, p in self.route.handles:
-                shape.addRect(QRectF(p.x() - s / 2, p.y() - s / 2, s, s))
-        return shape
+        selected = self.isSelected()
+        if self._shape is None or self._shape_sel != selected:
+            stroker = QPainterPathStroker()
+            stroker.setWidth(12)
+            shape = stroker.createStroke(self.path())
+            if selected and self.route is not None:
+                s = HANDLE_HIT
+                for _key, p in self.route.handles:
+                    shape.addRect(QRectF(p.x() - s / 2, p.y() - s / 2, s, s))
+            self._shape, self._shape_sel = shape, selected
+        return self._shape
 
     def handle_at(self, pos: QPointF) -> str | None:
         if not self.isSelected() or self.route is None:
@@ -2220,6 +2406,8 @@ class DiagramScene(QGraphicsScene):
         self._pending: NodeItem | None = None
         self._rubber: QGraphicsPathItem | None = None
         self._press_scene_pos = QPointF()
+        self._layout_batch = 0              # > 0: relayout() only takes note ...
+        self._layout_pending = False        # ... that one is needed (see batched_layout)
 
     # ---- helpers ---------------------------------------------------------- #
     def snap_point(self, p: QPointF, step: float = GRID) -> QPointF:
@@ -2402,13 +2590,31 @@ class DiagramScene(QGraphicsScene):
 
     # ---- connection layout --------------------------------------------------- #
     def relayout(self) -> None:
-        """Recompute ports and routes of every connection."""
+        """Recompute ports and routes of every connection. Inside a
+        batched_layout() block this is postponed to the end of the block."""
+        if self._layout_batch:
+            self._layout_pending = True
+            return
+        self._layout_pending = False
         conns = self.connection_items()
         if not conns:
             return
         layout_connections(conns)
         for c in conns:
             c.apply_route()
+
+    @contextmanager
+    def batched_layout(self):
+        """Run a block that may call relayout() many times (dragging several
+        selected items moves them one by one, and every move asks for a
+        relayout) and lay the connections out only once, at the end."""
+        self._layout_batch += 1
+        try:
+            yield
+        finally:
+            self._layout_batch -= 1
+            if not self._layout_batch and self._layout_pending:
+                self.relayout()
 
     def drag_connection_handle(self, conn: ConnectionItem, key: str,
                                pos: QPointF) -> bool:
@@ -2523,7 +2729,8 @@ class DiagramScene(QGraphicsScene):
             self._update_rubber(event.scenePos())
             event.accept()
             return
-        super().mouseMoveEvent(event)
+        with self.batched_layout():         # one relayout per mouse move, however
+            super().mouseMoveEvent(event)   # many selected items are being dragged
 
     def mouseReleaseEvent(self, event) -> None:
         if self.mode == MODE_SELECT:
@@ -2574,7 +2781,7 @@ class DiagramScene(QGraphicsScene):
         while y <= rect.bottom():
             lines.append(QLineF(rect.left(), y, rect.right(), y))
             y += GRID
-        painter.setPen(QPen(QColor("#e6e9ee"), 0))
+        painter.setPen(GRID_PEN)
         painter.drawLines(lines)
 
     # ---- persistence ------------------------------------------------------- #
@@ -2737,7 +2944,10 @@ class DiagramView(QGraphicsView):
         self.setMouseTracking(True)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        # Repaint only the regions that changed (not the whole viewport on every
+        # change). Safe because every item announces geometry changes through
+        # prepareGeometryChange() before its bounding rect changes.
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
         self._pan_last = None
         self.centerOn(0, 0)
 
@@ -4071,20 +4281,14 @@ def make_icon(kind: str) -> QIcon:
         p.drawLine(QLineF(16, 8.5, 16, 25))
     elif kind == MODE_DOCUMENT:
         p.setBrush(C_DOC_FILL)
-        p.drawPolygon(QPolygonF([QPointF(11, 6), QPointF(27, 6), QPointF(27, 26),
-                                 QPointF(5, 26), QPointF(5, 12)]))
-        p.setBrush(C_DOC_FOLD)
-        p.drawPolygon(QPolygonF([QPointF(11, 6), QPointF(11, 12), QPointF(5, 12)]))
-    elif kind == MODE_CONNECT:
-        p.setBrush(C_PROCESS_FILL)
-        p.drawRect(QRectF(2, 18, 11, 9))
-        p.setBrush(C_DOC_FILL)
-        p.drawRect(QRectF(19, 5, 11, 9))
-        p.setPen(QPen(C_ARROW, 2))
+        draw_document_shape(p, QRectF(5, 6, 22, 20), 6)
+    elif kind == MODE_CONNECT:           # an arrow from left to right, like the connections
+        # 3 px shaft centred on y = 16.5, so it covers whole pixel rows (crisp edges)
+        p.setPen(QPen(C_ARROW, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QLineF(3, 16.5, 20, 16.5))  # the shaft ends under the head
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(C_ARROW)
-        p.drawLine(QLineF(8, 18, 22, 15))
-        p.drawPolygon(QPolygonF([QPointF(24, 14.5), QPointF(17.5, 11.5),
-                                 QPointF(18.5, 18.5)]))
+        p.drawPolygon(QPolygonF([QPointF(29, 16.5), QPointF(18, 9.5), QPointF(18, 23.5)]))
     p.end()
     return QIcon(pm)
 
@@ -4345,8 +4549,12 @@ class MainWindow(QMainWindow):
 
     def _select_all(self) -> None:
         if self.scene.mode == MODE_SELECT:
-            for item in self.scene.items():
-                item.setSelected(True)
+            # one selection change (one selectionChanged signal) instead of
+            # one per item, each of which re-evaluated the panels under the diagram
+            area = QPainterPath()
+            area.addRect(self.scene.itemsBoundingRect().adjusted(-10, -10, 10, 10))
+            self.scene.setSelectionArea(area, Qt.ItemSelectionOperation.ReplaceSelection,
+                                        Qt.ItemSelectionMode.IntersectsItemBoundingRect)
 
     def _toggle_grid(self, checked: bool) -> None:
         self.scene.show_grid = checked
