@@ -621,8 +621,14 @@ def build_route(c, placed) -> Route:
                      bases, used)
 
     # --- the target is not to the right: leave right, turn back, enter left ---
-    xo_lo = sx + 6
-    xi_hi = ex - ARROW_LEN - 1
+    # The middle (horizontal) lane runs in one of three zones:
+    #   "gap"     between the two items (only when one is above the other)
+    #   "top"     above both items     } the vertical lanes then go round
+    #   "bottom"  below both items     } both items, too
+    # Automatically it takes the gap when there is one, otherwise the side
+    # nearer to the ports; dragged by hand it may go to any of the zones.
+    topb = min(a.top(), b.top()) - 6          # a lane above both items: y <= topb
+    botb = max(a.bottom(), b.bottom()) + 6    # ... below both items: y >= botb
     if case in ("below", "above"):
         if case == "below":
             ylo, yhi = a.bottom() + 4, b.top() - 4
@@ -633,33 +639,48 @@ def build_route(c, placed) -> Route:
         if ylo > yhi:
             ylo = yhi = ym0
         ym_steps = (1, -1)
-        xo0, xi0 = sx + STUB, ex - STUB
+        zone = "gap"
     else:                                                    # round
         top = min(a.top(), b.top()) - STUB
         bottom = max(a.bottom(), b.bottom()) + STUB
         use_top = (abs(y1 - top) + abs(y2 - top)
                    <= abs(y1 - bottom) + abs(y2 - bottom))
         if use_top:
-            ym0, ylo, yhi, ym_steps = top, -BIG, min(a.top(), b.top()) - 6, (-1,)
+            ym0, ylo, yhi, ym_steps, zone = top, -BIG, topb, (-1,), "top"
         else:
-            ym0, ylo, yhi, ym_steps = bottom, max(a.bottom(), b.bottom()) + 6, BIG, (1,)
+            ym0, ylo, yhi, ym_steps, zone = bottom, botb, BIG, (1,), "bottom"
+
+    manual_mid = "mid" in off
+    if manual_mid:                            # dragged: the nearest zone that is allowed
+        bases["mid"] = ym0
+        ym = ym0 + off["mid"]
+        zones = [(-BIG, topb, "top"), (botb, BIG, "bottom")]
+        if case in ("below", "above"):
+            zones.insert(0, (ylo, yhi, "gap"))
+
+        def distance(z):
+            lo, hi, _name = z
+            return 0.0 if lo <= ym <= hi else min(abs(ym - lo), abs(ym - hi))
+
+        lo, hi, zone = min(zones, key=distance)
+        ym = min(max(ym, lo), hi)
+        used["mid"] = ym
+
+    if zone == "gap":                         # leave and enter right next to the items
+        xo0, xi0 = sx + STUB, ex - STUB
+        xo_lo = sx + 6
+        xi_hi = ex - ARROW_LEN - 1
+    else:                                     # go round both items
         xo0 = max(a.right(), b.right()) + STUB
         xi0 = min(a.left(), b.left()) - STUB
         xo_lo = max(a.right(), b.right()) + 6
         xi_hi = min(a.left(), b.left()) - ARROW_LEN - 1
-    xo = lane("out", xo0, lambda v: [("v", v, y1, ym0), ("h", y1, sx, v)],
+    yv = ym if manual_mid else ym0            # where the vertical lanes turn
+    xo = lane("out", xo0, lambda v: [("v", v, y1, yv), ("h", y1, sx, v)],
               xo_lo, BIG, (1, -1))
-    xi = lane("in", xi0, lambda v: [("v", v, ym0, y2), ("h", y2, v, ex)],
+    xi = lane("in", xi0, lambda v: [("v", v, yv, y2), ("h", y2, v, ex)],
               -BIG, xi_hi, (-1, 1))
-    if case == "round" and "mid" in off:      # may be dragged to the other side
-        bases["mid"] = ym0
-        ym = ym0 + off["mid"]
-        topb = min(a.top(), b.top()) - 6
-        botb = max(a.bottom(), b.bottom()) + 6
-        if topb < ym < botb:                  # not through the items: nearest side
-            ym = topb if ym - topb <= botb - ym else botb
-        used["mid"] = ym
-    else:
+    if not manual_mid:
         ym = lane("mid", ym0, lambda v: [("h", v, xo, xi)], ylo, yhi, ym_steps)
     pts = [P(sx, y1), P(xo, y1), P(xo, ym), P(xi, ym), P(xi, y2), P(ex, y2)]
     segs = [("h", y1, min(sx, xo), max(sx, xo), None),
