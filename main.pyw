@@ -140,9 +140,11 @@ from PySide6.QtWidgets import (
     QAbstractItemDelegate,
     QAbstractItemView,
     QApplication,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFileDialog,
     QFormLayout,
     QGraphicsItem,
@@ -260,6 +262,7 @@ C_PROCESS_FILL = QColor("#dbe9fb")
 C_EXTERNAL_FILL = QColor("#c3c8d0")
 C_DOC_FILL = QColor("#fff4c9")
 C_DOC_FOLD = QColor("#e4cf84")
+FOLD_DARKER = 115       # a chosen document colour: its fold is this much darker (%)
 C_ARROW = QColor("#3b4658")
 GRID_PEN = QPen(QColor("#f2f4f7"), 0)     # cosmetic 1 px pen of the background grid
 
@@ -1633,10 +1636,12 @@ class NodeItem(QGraphicsItem):
     RESIZABLE = True
     CONNECTABLE = True    # False: connections to or from it are refused (text comment)
     SNAP = GRID           # position snaps to multiples of this (see ExternalItem)
+    CUSTOM_FILL = False   # True: its background colour can be changed (Properties panel)
 
     def __init__(self, x: float, y: float, w: float, h: float, text: str = ""):
         super().__init__()
         self._rect = QRectF(0, 0, w, h)
+        self.fill: QColor | None = None       # chosen background colour; None: FILL
         self.text = text
         self.connections: list[ConnectionItem] = []
         self.hint: str | None = None          # None | "source" | "target"
@@ -1706,6 +1711,34 @@ class NodeItem(QGraphicsItem):
     def display_name(self) -> str:
         label = " ".join(self.text.split())
         return f"{self.NAME} '{label}'" if label else f"unnamed {self.NAME}"
+
+    def fill_color(self) -> QColor:
+        """The background colour: the one chosen for this item, or the default."""
+        return self.fill if self.fill is not None else self.FILL
+
+    def set_fill(self, color) -> bool:
+        """Set the background colour (None: back to the default). Returns
+        whether anything changed."""
+        if color is not None:
+            color = QColor(color)
+            if not color.isValid() or not self.CUSTOM_FILL or color.rgb() == self.FILL.rgb():
+                color = None                  # the default colour is stored as "none"
+        old = self.fill.rgb() if self.fill is not None else None
+        new = color.rgb() if color is not None else None
+        if old == new:
+            return False
+        self.fill = color
+        self.update()
+        return True
+
+    def set_name(self, text: str) -> bool:
+        """Rename (as the Rename dialog does). Returns whether anything changed."""
+        text = text.strip()
+        if text == self.text:
+            return False
+        self.text = text
+        self.refresh_geometry()
+        return True
 
     # ---- resize handles --------------------------------------------------- #
     def _handle_points(self) -> dict[str, QPointF]:
@@ -1780,7 +1813,7 @@ class NodeItem(QGraphicsItem):
             pen = QPen(C_OUTLINE, 1.6)
         pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         painter.setPen(pen)
-        painter.setBrush(self.FILL)
+        painter.setBrush(self.fill_color())
         self.draw_body(painter)
 
         self.draw_label(painter)
@@ -1878,8 +1911,11 @@ class NodeItem(QGraphicsItem):
     def to_dict(self, node_id: int, ids: dict | None = None,
                 files: dict | None = None) -> dict:
         r = self.scene_rect()
-        return {"id": node_id, "type": self.KIND, "text": self.text,
-                "x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
+        d = {"id": node_id, "type": self.KIND, "text": self.text,
+             "x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
+        if self.fill is not None:
+            d["fill"] = self.fill.name()      # "#rrggbb"; absent means the default
+        return d
 
 
 class ProcessItem(NodeItem):
@@ -1887,6 +1923,7 @@ class ProcessItem(NodeItem):
     NAME = "process"
     FILL = C_PROCESS_FILL
     DEFAULT_SIZE = (140, 80)
+    CUSTOM_FILL = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1933,9 +1970,10 @@ def _build_paperclip() -> QPainterPath:
     return p
 
 
-def draw_document_shape(painter: QPainter, r: QRectF, e: float) -> None:
+def draw_document_shape(painter: QPainter, r: QRectF, e: float,
+                        fold: QColor = C_DOC_FOLD) -> None:
     """A document: the rectangle `r` with its upper-left corner folded over by
-    `e`. Uses the painter's pen and brush for the body and C_DOC_FOLD for the
+    `e`. Uses the painter's pen and brush for the body and `fold` for the
     fold. (Shared by the diagram item and the toolbar icon.)"""
     tip_top = QPointF(r.left() + e, r.top())       # where the fold meets the top border
     tip_left = QPointF(r.left(), r.top() + e)      # ... and the left border
@@ -1944,7 +1982,7 @@ def draw_document_shape(painter: QPainter, r: QRectF, e: float) -> None:
                                    r.bottomLeft(), tip_left]))
     pen = QPen(painter.pen())
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(C_DOC_FOLD)
+    painter.setBrush(fold)
     painter.drawPolygon(QPolygonF([tip_top, inner, tip_left]))
     # The fold is outlined with open lines, not as a closed triangle: a closed
     # triangle gets mitred joins at its two 45-degree tips, which stick out past
@@ -1964,6 +2002,7 @@ class DocumentItem(NodeItem):
     NAME = "document"
     FILL = C_DOC_FILL
     DEFAULT_SIZE = (120, 80)
+    CUSTOM_FILL = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2038,8 +2077,12 @@ class DocumentItem(NodeItem):
     def ear(self) -> float:
         return min(EAR, self._rect.width() / 3, self._rect.height() / 3)
 
+    def fold_color(self) -> QColor:
+        """The fold: the usual darker yellow, or a shade of the chosen colour."""
+        return C_DOC_FOLD if self.fill is None else self.fill.darker(FOLD_DARKER)
+
     def draw_body(self, painter: QPainter) -> None:
-        draw_document_shape(painter, self._rect, self.ear() * EAR_DRAWN)
+        draw_document_shape(painter, self._rect, self.ear() * EAR_DRAWN, self.fold_color())
 
     def usable_span(self, side: str) -> tuple[float, float]:
         # The dog-ear cuts away the first `ear` px of the left and top sides.
@@ -2205,6 +2248,13 @@ class CommentItem(NodeItem):
         painter.setFont(QApplication.font())
         painter.setPen(C_TEXT)
         painter.drawText(self._rect, self._text, opt)
+
+    def set_name(self, text: str) -> bool:
+        new = comment_text(text)              # one line; empty becomes UNDEF_TEXT
+        if new == self._text:
+            return False
+        self.text = new
+        return True
 
     def edit_text(self) -> None:
         sc = self.scene()
@@ -2787,7 +2837,9 @@ class DiagramScene(QGraphicsScene):
                 {MODE_PROCESS: PROCESS, MODE_DOCUMENT: DOCUMENT,
                  MODE_EXTERNAL: EXTERNAL, MODE_COMMENT: COMMENT}[self.mode], pos)
             self.set_mode(MODE_SELECT)
-            item.edit_text()          # ask for the name straight away
+            if isinstance(item, CommentItem):
+                item.edit_text()      # a comment is only its text: ask for it straight away
+            # the others are named in the Properties panel (or with F2 / double-click)
         elif self.mode == MODE_CONNECT:
             node = self.node_at(pos)
             if node is None:
@@ -2886,10 +2938,13 @@ class DiagramScene(QGraphicsScene):
             cls = NODE_CLASSES.get(nd["type"])
             if cls is None:
                 raise ValueError(f"Unknown node type: {nd['type']!r}")
-            by_id[nd["id"]] = cls(
+            node = by_id[nd["id"]] = cls(
                 float(nd["x"]), float(nd["y"]),
                 max(MIN_W, float(nd["w"])), max(MIN_H, float(nd["h"])),
                 str(nd.get("text", "")))
+            fill = nd.get("fill")
+            if cls.CUSTOM_FILL and isinstance(fill, str):
+                node.set_fill(QColor(fill))      # an invalid colour leaves the default
         conns = []
         for cd in data.get("connections", []):
             a, b = by_id[cd["source"]], by_id[cd["target"]]
@@ -4465,6 +4520,160 @@ MODE_HINTS = {
 }
 
 
+class PropertiesPanel(QWidget):
+    """The Properties panel on the right of the window: the name of the
+    selected process, document, external process or comment, and the
+    background colour of a process or document. Changes apply at once."""
+
+    SWATCH = 16                        # size of the colour sample on the button
+
+    def __init__(self, scene: DiagramScene, parent=None):
+        super().__init__(parent)
+        self.scene = scene
+        self.item: NodeItem | None = None
+        self._loading = False          # True while the fields are filled from the item
+
+        self.kind_label = QLabel()
+        f = self.kind_label.font()
+        f.setBold(True)
+        self.kind_label.setFont(f)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setClearButtonEnabled(True)
+        self.name_edit.textEdited.connect(self._name_edited)
+        self.name_edit.editingFinished.connect(self._name_finished)
+
+        self.color_button = QPushButton()
+        self.color_button.setToolTip("Choose the background colour")
+        self.color_button.clicked.connect(self._choose_color)
+        self.default_button = QPushButton("Default")
+        self.default_button.setToolTip("Back to the usual colour of this kind of item")
+        self.default_button.clicked.connect(lambda: self._apply_color(None))
+        color_row = QWidget()
+        row = QHBoxLayout(color_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.color_button, 1)
+        row.addWidget(self.default_button)
+        self.color_label = QLabel("Background:")
+        self.color_row = color_row
+
+        self.form = QWidget()
+        form = QFormLayout(self.form)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.addRow("Name:", self.name_edit)
+        form.addRow(self.color_label, color_row)
+
+        self.info = QLabel()           # shown instead of the fields
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color: #6b7380;")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.addWidget(self.kind_label)
+        lay.addWidget(self.form)
+        lay.addWidget(self.info)
+        lay.addStretch(1)
+        self.show_selection([])
+
+    # ---- which item -------------------------------------------------------- #
+    def show_selection(self, items) -> None:
+        """Show the properties of the single selected item (or say why not)."""
+        self.item = None
+        node = items[0] if len(items) == 1 and isinstance(items[0], NodeItem) else None
+        if node is not None:
+            self.item = node
+            self.kind_label.setText(node.NAME[:1].upper() + node.NAME[1:])
+            self.form.show()
+            self.info.hide()
+            self._fill_fields(force=True)
+            return
+        self.form.hide()
+        self.info.show()
+        if not items:
+            self.kind_label.setText("No selection")
+            self.info.setText("Select an item on the diagram to see and change its properties.")
+        elif len(items) == 1 and isinstance(items[0], ConnectionItem):
+            c = items[0]
+            self.kind_label.setText("Connection")
+            self.info.setText(f"From the {c.source.display_name()} to the "
+                              f"{c.target.display_name()}.\nA connection has no "
+                              "properties to change here.")
+        else:
+            self.kind_label.setText(f"{len(items)} items selected")
+            self.info.setText("Select a single item to change its properties.")
+
+    def on_content_changed(self) -> None:
+        """Something in the diagram changed (e.g. renamed with F2): show it."""
+        if self.item is None:
+            return
+        try:
+            alive = self.item.scene() is self.scene
+        except RuntimeError:           # the item was deleted
+            alive = False
+        if not alive:
+            self.show_selection([])
+            return
+        self._fill_fields(force=False)
+
+    def _fill_fields(self, force: bool) -> None:
+        it = self.item
+        self._loading = True
+        try:
+            shown = " ".join(it.text.split())
+            # never overwrite what is being typed (the item may store it normalised)
+            if force or (not self.name_edit.hasFocus() and self.name_edit.text() != shown):
+                self.name_edit.setText(shown)
+                self.name_edit.setCursorPosition(0)
+            self.name_edit.setPlaceholderText(
+                f"empty text becomes “{UNDEF_TEXT}”" if isinstance(it, CommentItem)
+                else f"name of the {it.NAME}")
+            fillable = it.CUSTOM_FILL
+            self.color_label.setVisible(fillable)
+            self.color_row.setVisible(fillable)
+            if fillable:
+                color = it.fill_color()
+                pm = QPixmap(self.SWATCH, self.SWATCH)
+                pm.fill(color)
+                p = QPainter(pm)
+                p.setPen(QPen(C_OUTLINE, 1))
+                p.drawRect(0, 0, self.SWATCH - 1, self.SWATCH - 1)
+                p.end()
+                self.color_button.setIcon(QIcon(pm))
+                self.color_button.setText(color.name().upper()
+                                          + (" (default)" if it.fill is None else ""))
+                self.default_button.setEnabled(it.fill is not None)
+        finally:
+            self._loading = False
+
+    # ---- editing ------------------------------------------------------------ #
+    def _name_edited(self, text: str) -> None:
+        """Typing renames the item at once (the diagram follows as you type)."""
+        if self._loading or self.item is None:
+            return
+        if self.item.set_name(text):
+            self.scene.touch()
+
+    def _name_finished(self) -> None:
+        """Enter or leaving the field: show the name as it is stored (trimmed;
+        an empty comment text becomes the placeholder text)."""
+        if self.item is not None:
+            self._fill_fields(force=True)
+
+    def _choose_color(self) -> None:
+        if self.item is None:
+            return
+        color = QColorDialog.getColor(self.item.fill_color(), self,
+                                      f"Background colour of the {self.item.display_name()}")
+        if color.isValid():
+            self._apply_color(color)
+
+    def _apply_color(self, color) -> None:
+        if self.item is not None and self.item.set_fill(color):
+            self.scene.touch()
+            self._fill_fields(force=False)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4485,6 +4694,14 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setChildrenCollapsible(False)
         self.setCentralWidget(self.splitter)
+        self.props = PropertiesPanel(self.scene)
+        self.props_dock = QDockWidget("Properties", self)
+        self.props_dock.setObjectName("properties")
+        self.props_dock.setWidget(self.props)
+        self.props_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea
+                                        | Qt.DockWidgetArea.RightDockWidgetArea)
+        self.props_dock.setMinimumWidth(230)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.props_dock)
         self.file_path: Path | None = None
         self.roles_window: RolesWindow | None = None   # created on first use
         self._last_action_role = ""          # preselected in the next Role actions report
@@ -4501,6 +4718,7 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._on_selection_changed)
         self.scene.contentChanged.connect(self.panel.on_content_changed)
         self.scene.contentChanged.connect(self.files_panel.on_content_changed)
+        self.scene.contentChanged.connect(self.props.on_content_changed)
         self.scene.rolesChanged.connect(self.panel.on_content_changed)
         self.panel.rolesRequested.connect(self.show_roles)
         self.splitter.splitterMoved.connect(self._remember_panel_height)
@@ -4604,6 +4822,11 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.a_grid)
         m.addAction(self.a_snap)
+        m.addSeparator()
+        a_props = self.props_dock.toggleViewAction()   # show / hide the panel
+        a_props.setText("&Properties panel")
+        a_props.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        m.addAction(a_props)
 
         tb = QToolBar("Tools")
         tb.setMovable(False)
@@ -4626,6 +4849,7 @@ class MainWindow(QMainWindow):
             items = self.scene.selectedItems()
         except RuntimeError:
             return
+        self.props.show_selection(items)  # the Properties panel on the right
         self._reveal_token += 1           # a scroll planned for an earlier selection is void
         sel = items[0] if len(items) == 1 else None
         proc = sel if isinstance(sel, ProcessItem) else None
