@@ -1637,11 +1637,13 @@ class NodeItem(QGraphicsItem):
     CONNECTABLE = True    # False: connections to or from it are refused (text comment)
     SNAP = GRID           # position snaps to multiples of this (see ExternalItem)
     CUSTOM_FILL = False   # True: its background colour can be changed (Properties panel)
+    HAS_HINT = True       # it can have a hint: shown when the pointer rests on it
 
     def __init__(self, x: float, y: float, w: float, h: float, text: str = ""):
         super().__init__()
         self._rect = QRectF(0, 0, w, h)
         self.fill: QColor | None = None       # chosen background colour; None: FILL
+        self.hint_text = ""                   # the hint (Properties panel): free text, may have several lines
         self.text = text
         self.connections: list[ConnectionItem] = []
         self.hint: str | None = None          # None | "source" | "target"
@@ -1730,6 +1732,33 @@ class NodeItem(QGraphicsItem):
         self.fill = color
         self.update()
         return True
+
+    def set_hint(self, text: str) -> bool:
+        """Set the hint (blank lines around it are dropped). Returns whether
+        anything changed."""
+        text = text.strip() if self.HAS_HINT else ""
+        if text == self.hint_text:
+            return False
+        self.hint_text = text
+        self.update_tooltip()
+        return True
+
+    def tooltip_extra(self) -> str:
+        """More for the tooltip, shown under the hint (see DocumentItem)."""
+        return ""
+
+    def update_tooltip(self) -> None:
+        """The tooltip: the hint, and under it anything tooltip_extra() adds."""
+        extra = self.tooltip_extra()
+        if not self.hint_text:
+            self.setToolTip(extra)           # plain text, as before hints existed
+            return
+        # rich text, so that line breaks are kept and long lines wrap; the
+        # hint itself is escaped - it is shown as typed, never as markup
+        tip = "<qt>" + html.escape(self.hint_text).replace("\n", "<br>")
+        if extra:
+            tip += f"<br><span style='color:#6b7380'>{html.escape(extra)}</span>"
+        self.setToolTip(tip + "</qt>")
 
     def set_name(self, text: str) -> bool:
         """Rename (as the Rename dialog does). Returns whether anything changed."""
@@ -1915,6 +1944,8 @@ class NodeItem(QGraphicsItem):
              "x": r.x(), "y": r.y(), "w": r.width(), "h": r.height()}
         if self.fill is not None:
             d["fill"] = self.fill.name()      # "#rrggbb"; absent means the default
+        if self.hint_text:
+            d["hint"] = self.hint_text
         return d
 
 
@@ -2038,11 +2069,14 @@ class DocumentItem(NodeItem):
         del self.links[index]
         self.attachments_changed()
 
-    def attachments_changed(self) -> None:
+    def tooltip_extra(self) -> str:
         n, m = len(self.attachments), len(self.links)
         parts = ([f"{n} attached file{'' if n == 1 else 's'}"] if n else []) + \
                 ([f"{m} link{'' if m == 1 else 's'}"] if m else [])
-        self.setToolTip(", ".join(parts))
+        return ", ".join(parts)
+
+    def attachments_changed(self) -> None:
+        self.update_tooltip()                 # the hint, then the number of files and links
         self.update()
 
     def draw_label(self, painter: QPainter) -> None:
@@ -2193,6 +2227,7 @@ class CommentItem(NodeItem):
     DEFAULT_SIZE = (60, 24)
     RESIZABLE = False
     CONNECTABLE = False
+    HAS_HINT = False      # a comment is only its text
     SNAP = GRID / 2
     PAD = 3.0                          # space around the text (the clickable area)
 
@@ -2945,6 +2980,9 @@ class DiagramScene(QGraphicsScene):
             fill = nd.get("fill")
             if cls.CUSTOM_FILL and isinstance(fill, str):
                 node.set_fill(QColor(fill))      # an invalid colour leaves the default
+            hint = nd.get("hint")
+            if cls.HAS_HINT and isinstance(hint, str):
+                node.set_hint(hint)
         conns = []
         for cd in data.get("connections", []):
             a, b = by_id[cd["source"]], by_id[cd["target"]]
@@ -4466,6 +4504,12 @@ class DocumentFilesPanel(QWidget):
 # --------------------------------------------------------------------------- #
 # Toolbar icons (drawn in code, so no resource files are needed)
 # --------------------------------------------------------------------------- #
+ICON_DELETE = "delete"           # make_icon() kinds besides the modes
+ICON_ZOOM_FIT = "zoom-fit"
+C_DELETE = QColor("#d63b3b")     # the red of the Delete icon
+C_LENS = QColor("#e8f1fc")       # the glass of the Zoom to fit icon
+
+
 def make_icon(kind: str) -> QIcon:
     pm = QPixmap(32, 32)
     pm.fill(Qt.GlobalColor.transparent)
@@ -4499,6 +4543,19 @@ def make_icon(kind: str) -> QIcon:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(C_ARROW)
         p.drawPolygon(QPolygonF([QPointF(29, 16.5), QPointF(18, 9.5), QPointF(18, 23.5)]))
+    elif kind == ICON_DELETE:            # a red diagonal cross
+        p.setPen(QPen(C_DELETE, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QLineF(8.5, 8.5, 23.5, 23.5))
+        p.drawLine(QLineF(23.5, 8.5, 8.5, 23.5))
+    elif kind == ICON_ZOOM_FIT:          # a magnifying glass
+        p.setPen(QPen(C_OUTLINE, 4.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QLineF(19.5, 19.5, 26.5, 26.5))          # the handle
+        p.setPen(QPen(C_OUTLINE, 2.4))
+        p.setBrush(C_LENS)
+        p.drawEllipse(QPointF(13.5, 13.5), 8.5, 8.5)        # the lens
+        p.setPen(QPen(QColor(255, 255, 255, 200), 1.6, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
+        p.drawArc(QRectF(8.5, 8.5, 10, 10), 100 * 16, 70 * 16)   # a glint on the glass
     p.end()
     return QIcon(pm)
 
@@ -4509,10 +4566,12 @@ def make_icon(kind: str) -> QIcon:
 MODE_HINTS = {
     MODE_SELECT: "Select: drag to move, drag handles to resize (also on a selected "
                  "connection), double-click or F2 to rename, Del to delete.",
-    MODE_PROCESS: "Click on the canvas to place a process, then type its name (Esc to cancel).",
-    MODE_DOCUMENT: "Click on the canvas to place a document, then type its name (Esc to cancel).",
+    MODE_PROCESS: "Click on the canvas to place a process, then name it in the Properties "
+                  "panel (Esc to cancel).",
+    MODE_DOCUMENT: "Click on the canvas to place a document, then name it in the Properties "
+                   "panel (Esc to cancel).",
     MODE_EXTERNAL: "Click on the canvas to place an external process (one connection only), "
-                   "then type its name (Esc to cancel).",
+                   "then name it in the Properties panel (Esc to cancel).",
     MODE_COMMENT: "Click on the canvas to place a text comment (no border, cannot be "
                   "connected), then type its text (Esc to cancel).",
     MODE_CONNECT: "Connect: drag (or click) from a process to a document "
@@ -4522,8 +4581,9 @@ MODE_HINTS = {
 
 class PropertiesPanel(QWidget):
     """The Properties panel on the right of the window: the name of the
-    selected process, document, external process or comment, and the
-    background colour of a process or document. Changes apply at once."""
+    selected process, document, external process or comment, the hint of the
+    first three, and the background colour of a process or document.
+    Changes apply at once."""
 
     SWATCH = 16                        # size of the colour sample on the button
 
@@ -4557,11 +4617,22 @@ class PropertiesPanel(QWidget):
         self.color_label = QLabel("Background:")
         self.color_row = color_row
 
+        self.hint_edit = QPlainTextEdit()
+        self.hint_edit.setTabChangesFocus(True)        # Tab moves on, as in the other fields
+        self.hint_edit.setPlaceholderText("Shown when the pointer rests on the item")
+        lines = self.fontMetrics().lineSpacing()
+        self.hint_edit.setMinimumHeight(lines * 3 + 12)
+        self.hint_edit.setMaximumHeight(lines * 8 + 12)
+        self.hint_edit.textChanged.connect(self._hint_edited)
+        self.hint_label = QLabel("Hint:")
+
         self.form = QWidget()
         form = QFormLayout(self.form)
         form.setContentsMargins(0, 4, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         form.addRow("Name:", self.name_edit)
+        form.addRow(self.hint_label, self.hint_edit)
         form.addRow(self.color_label, color_row)
 
         self.info = QLabel()           # shown instead of the fields
@@ -4628,6 +4699,11 @@ class PropertiesPanel(QWidget):
             self.name_edit.setPlaceholderText(
                 f"empty text becomes “{UNDEF_TEXT}”" if isinstance(it, CommentItem)
                 else f"name of the {it.NAME}")
+            self.hint_label.setVisible(it.HAS_HINT)
+            self.hint_edit.setVisible(it.HAS_HINT)
+            if it.HAS_HINT and (force or (not self.hint_edit.hasFocus()
+                                          and self.hint_edit.toPlainText() != it.hint_text)):
+                self.hint_edit.setPlainText(it.hint_text)
             fillable = it.CUSTOM_FILL
             self.color_label.setVisible(fillable)
             self.color_row.setVisible(fillable)
@@ -4652,6 +4728,13 @@ class PropertiesPanel(QWidget):
         if self._loading or self.item is None:
             return
         if self.item.set_name(text):
+            self.scene.touch()
+
+    def _hint_edited(self) -> None:
+        """Typing changes the hint at once."""
+        if self._loading or self.item is None:
+            return
+        if self.item.set_hint(self.hint_edit.toPlainText()):
             self.scene.touch()
 
     def _name_finished(self) -> None:
@@ -4758,7 +4841,8 @@ class MainWindow(QMainWindow):
 
         self.a_edit = S("&Rename", self.scene.edit_selected_label, "F2")
         self.a_delete = S("&Delete", self.scene.delete_selected,
-                          [QKeySequence.StandardKey.Delete, "Backspace"])
+                          [QKeySequence.StandardKey.Delete, "Backspace"],
+                          icon=make_icon(ICON_DELETE))
         self.a_select_all = S("Select &all", self._select_all,
                               QKeySequence.StandardKey.SelectAll)
         self.a_reset_route = S("Reset connection &routing",
@@ -4770,7 +4854,8 @@ class MainWindow(QMainWindow):
         self.a_zoom_out = S("Zoom &out", lambda: self.view.zoom(0.8),
                             QKeySequence.StandardKey.ZoomOut)
         self.a_zoom_reset = S("&Reset zoom", self.view.reset_zoom, "Ctrl+0")
-        self.a_zoom_fit = S("Zoom to &fit", self.view.zoom_to_fit, "Ctrl+9")
+        self.a_zoom_fit = S("Zoom to &fit", self.view.zoom_to_fit, "Ctrl+9",
+                            icon=make_icon(ICON_ZOOM_FIT))
         self.a_grid = S("Show &grid", self._toggle_grid, checkable=True)
         self.a_grid.setChecked(True)
         self.a_snap = S("&Snap to grid", self._toggle_snap, checkable=True)
