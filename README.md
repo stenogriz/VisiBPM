@@ -10,6 +10,11 @@ This tool gives businesses a simple way to describe their processes without the 
 - Document
 - External process link (a process outside the scope of the current procedure)
 
+<br />
+<p align="center">
+  <img width="974" height="410" alt="Clipboard_11-18-2026_01" src="https://github.com/user-attachments/assets/ed0abf96-ab37-4c9b-a937-8bdac4a4aa87" />
+</p>
+
 It enforces one core rule in the procedure diagram: **processes interact only through documents.**
 
 In business terms, this means information must flow between processes. Physical objects such as goods, items, and shipments are covered by the same rule, because each one is always accompanied by a document (an invoice, an order, or another form) that carries its information.
@@ -21,7 +26,7 @@ Process description takes three answers:
 
 <br />
 <p align="center">
-  <img width="974" height="410" alt="Clipboard_11-18-2026_01" src="https://github.com/user-attachments/assets/ed0abf96-ab37-4c9b-a937-8bdac4a4aa87" />
+<img width="1402" height="718" alt="Clipboard_11-19-2026_01" src="https://github.com/user-attachments/assets/61b19669-b5ff-4577-b0c8-6099188eabef" />
 </p>
 
 ## Technical
